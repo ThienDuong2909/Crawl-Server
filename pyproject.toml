@@ -1,0 +1,39 @@
+[project]
+name = "douyin-nwm-tool"
+version = "0.1.0"
+description = "Minimal FastAPI service + worker for parsing and downloading Douyin no-watermark videos"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi==0.110.2",
+    "uvicorn==0.29.0",
+    "httpx==0.27.0",
+    "pydantic==2.7.0",
+    "PyYAML==6.0.1",
+    "aiofiles==23.2.1",
+    "qrcode==7.4.2",
+    "gmssl==3.2.2",
+    "pycryptodomex==3.20.0",
+    "rich==13.7.1",
+    "numpy",
+    "Pillow==11.3.0",
+    "browser-cookie3==0.19.1",
+    "pyfiglet==1.0.0",
+    "user-agents==2.2.0",
+    "importlib_resources==6.4.0",
+    "tenacity~=9.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest==8.3.5",
+    "pytest-asyncio==0.24.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["douyin_nwm_tool*", "tiktok_upload_service*", "crawlers*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+pythonpath = ["."]
+testpaths = ["tests"]

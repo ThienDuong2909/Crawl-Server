@@ -1,0 +1,12 @@
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DOWNLOAD_DIR=/shared/download TIKTOK_UPLOAD_DATA_DIR=/app/data TIKTOK_UPLOAD_MODE=dry_run PORT=8001
+WORKDIR /app
+RUN groupadd -r app && useradd -r -g app app
+COPY pyproject.toml README.md ./
+COPY tiktok_upload_service ./tiktok_upload_service
+RUN pip install --no-cache-dir -e .
+RUN mkdir -p /shared/download /app/data && chown -R app:app /app /shared
+USER app
+EXPOSE 8001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3).read()"
+CMD ["python", "-m", "uvicorn", "tiktok_upload_service.main:app", "--host", "0.0.0.0", "--port", "8001"]

@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Douyin NWM Dashboard</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <header>
+    <h1>Douyin NWM Dashboard</h1>
+    <p><strong>Giao diện mới:</strong> mở <code>http://VPS_IP:3000</code> để dùng React dashboard riêng, đẹp hơn và ẩn thông tin nhạy cảm tốt hơn. Trang cũ này chỉ giữ lại để debug API.</p>
+  </header>
+  <main>
+    <section class="card">
+      <h2>API Token (nếu VPS bật bảo vệ)</h2>
+      <label>X-API-Token</label>
+      <input id="apiTokenInput" placeholder="Để trống nếu server chưa bật API_AUTH_TOKEN" />
+      <button id="saveApiToken">Save token in browser</button>
+      <button id="clearApiToken">Clear token</button>
+      <p class="hint">Token chỉ lưu trong localStorage của trình duyệt này để JS gọi API kèm header.</p>
+    </section>
+
+    <section class="card">
+      <h2>Cookie</h2>
+      <div class="row"><button id="refreshCookie">Refresh status</button><span id="cookieBadge" class="badge">...</span></div>
+      <pre id="cookieStatus"></pre>
+      <label>Raw DOUYIN_COOKIE</label>
+      <textarea id="cookieInput" placeholder="ttwid=...; sessionid=...; sid_guard=..."></textarea>
+      <button id="saveCookie">Update Cookie</button>
+      <p class="hint">Local Chrome extension hãy POST Cookie về <code>/api/cookie/douyin/webhook</code>. Không paste Cookie vào nơi công khai.</p>
+    </section>
+
+    <section class="card">
+      <h2>Parse / Download</h2>
+      <label>Douyin URL</label>
+      <input id="urlInput" value="https://www.douyin.com/jingxuan?modal_id=7661129618388274483" />
+      <div class="row">
+        <button id="parseBtn">Parse</button>
+        <button id="downloadBtn">Start Download Job</button>
+      </div>
+      <pre id="parseOutput"></pre>
+    </section>
+
+    <section class="card wide">
+      <h2>Download Jobs</h2>
+      <button id="refreshJobs">Refresh jobs</button>
+      <div id="jobs"></div>
+    </section>
+
+    <section class="card wide video-library">
+      <div class="section-head">
+        <div>
+          <h2>Video đã tải / chuẩn bị upload TikTok</h2>
+          <p class="hint">Chọn video ở danh sách bên dưới để preview và đẩy sang upload service.</p>
+        </div>
+        <button id="refreshVideos">Refresh videos</button>
+      </div>
+      <div id="videoPreviewGrid" class="video-grid"></div>
+    </section>
+
+    <section class="card wide upload-workbench">
+      <div class="section-head">
+        <div>
+          <h2>TikTok Upload Service</h2>
+          <p class="hint">Bước hiện tại là dry-run: kiểm tra luồng upload job, chưa gửi request thật lên TikTok.</p>
+        </div>
+        <span class="badge ok">dry-run safe mode</span>
+      </div>
+      <div class="workbench-grid">
+        <div>
+          <label>Upload service base URL</label>
+          <input id="uploadServiceBase" placeholder="http://VPS_IP:8001" />
+          <div class="row">
+            <input id="uploadFilename" placeholder="douyin_<video_id>.mp4" />
+            <input id="uploadAccount" placeholder="tiktok_account_label" />
+          </div>
+          <label>Caption</label>
+          <textarea id="uploadCaption" placeholder="Caption #hashtag"></textarea>
+          <div class="row">
+            <button id="saveUploadBase">Save upload service URL</button>
+            <button id="startUploadJob">Start TikTok Upload Job</button>
+            <button id="refreshUploadJobs">Refresh upload jobs</button>
+          </div>
+        </div>
+        <aside class="preview-panel">
+          <h3>Preview video đã chọn</h3>
+          <div id="selectedVideoPreview" class="selected-preview empty">Chưa chọn video. Bấm “Chọn để upload TikTok” trong danh sách video.</div>
+        </aside>
+      </div>
+      <pre id="uploadOutput"></pre>
+      <div id="uploadJobs"></div>
+    </section>
+
+    <section class="card wide">
+      <h2>Metrics</h2>
+      <button id="refreshMetrics">Refresh metrics</button>
+      <pre id="metricsOutput"></pre>
+    </section>
+
+    <section class="card wide">
+      <h2>Local extension → VPS setup</h2>
+      <ol>
+        <li>Mở Chrome local: <code>chrome://extensions</code>, bật Developer mode.</li>
+        <li>Load thư mục <code>chrome-cookie-sniffer-vps</code> trên máy local.</li>
+        <li>Trong popup extension, đặt Webhook URL: <code>http://VPS_IP:8000/api/cookie/douyin/webhook</code>.</li>
+        <li>Nếu VPS có domain/TLS, dùng HTTPS. Không public nếu chưa có auth.</li>
+        <li>Khi bạn login lại Douyin trên Chrome local, extension bắt Cookie mới và đẩy về VPS.</li>
+      </ol>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

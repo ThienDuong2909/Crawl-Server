@@ -1,0 +1,58 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+gitleaks-report.json
+*.egg-info/
+build/
+dist/
+
+# Environment and credentials
+.env
+.env.*
+!.env.example
+secrets/*
+!secrets/README.md
+!secrets/*.example.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state and databases
+download/
+worker_downloads/
+douyin_crawl_data/
+tiktok_upload_data/
+subtitle_tests/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.jsonl
+
+# Generated media and diagnostics
+*.mp4
+*.mp3
+*.m4a
+*.aac
+*.webp
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.wav
+*.ass
+*.srt
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

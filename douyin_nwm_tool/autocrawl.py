@@ -862,6 +862,22 @@ class AutoCrawlManager:
             return "upload", self.db.update_video_auto_upload(video_id, status="queued", job_id=None, error=None)
         raise RuntimeError("Video has no retryable error")
 
+    @staticmethod
+    def _retry_translation_enabled(video: dict[str, Any]) -> bool:
+        """Return the policy captured with the video; legacy rows fail closed."""
+        raw_data = video.get("raw_data") or {}
+        if isinstance(raw_data, str):
+            try:
+                raw_data = json.loads(raw_data)
+            except (TypeError, ValueError):
+                raw_data = {}
+        if not isinstance(raw_data, dict) or "translate_enabled" not in raw_data:
+            return False
+        value = raw_data.get("translate_enabled")
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
     async def retry_video(self, video_id: str, action: str) -> None:
         video = self.db.get_video(video_id)
         if not video:
@@ -893,9 +909,18 @@ class AutoCrawlManager:
                 return
             await self._auto_upload_if_enabled(video_id)
             return
-        await self._auto_upload_if_enabled(video_id, force=True)
+        await self._auto_upload_if_enabled(
+            video_id,
+            force=True,
+            translate_enabled_override=self._retry_translation_enabled(video),
+        )
 
-    async def _auto_upload_if_enabled(self, video_id: str, force: bool = False) -> None:
+    async def _auto_upload_if_enabled(
+        self,
+        video_id: str,
+        force: bool = False,
+        translate_enabled_override: bool | None = None,
+    ) -> None:
         video = self.db.get_video(video_id)
         if not video or video.get("download_status") != "completed":
             return
@@ -910,7 +935,12 @@ class AutoCrawlManager:
             translate_title = getattr(self.auto_uploader, "translate_title", None)
             upload_translated = getattr(self.auto_uploader, "upload_translated", None)
             if callable(translate_title) and callable(upload_translated):
-                if channel.get("translate_enabled"):
+                translate_enabled = (
+                    bool(channel.get("translate_enabled"))
+                    if translate_enabled_override is None
+                    else bool(translate_enabled_override)
+                )
+                if translate_enabled:
                     stored_title = str(current_video.get("translated_title") or "").strip()
                     translated_title = stored_title.split("#", 1)[0].strip()
                     if translated_title and translated_title != stored_title:
@@ -1002,6 +1032,9 @@ class AutoCrawlManager:
                     if not should:
                         skipped += 1
                         continue
+                    captured_raw_data = dict(candidate.raw_data or {})
+                    captured_raw_data["translate_enabled"] = bool(channel.get("translate_enabled"))
+                    candidate.raw_data = captured_raw_data
                     self.db.record_video(channel["id"], candidate, status="pending")
                     new_videos += 1
                     if fallback_to_latest:
@@ -1215,6 +1248,13 @@ class AutoCrawlScheduler:
 
 def public_video_row(row: dict[str, Any]) -> dict[str, Any]:
     public = {k: v for k, v in row.items() if k not in {"local_path", "music_path", "subtitled_video_path", "raw_data"}}
+    raw_data = row.get("raw_data") or {}
+    if isinstance(raw_data, str):
+        try:
+            raw_data = json.loads(raw_data)
+        except (TypeError, ValueError):
+            raw_data = {}
+    public["translate_enabled"] = raw_data.get("translate_enabled") if isinstance(raw_data, dict) and "translate_enabled" in raw_data else None
     subtitle_path = str(row.get("subtitled_video_path") or "").strip()
     public["subtitled_video_filename"] = Path(subtitle_path).name if subtitle_path else None
     public["photo_files"] = []

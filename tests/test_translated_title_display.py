@@ -16,7 +16,7 @@ def completed_video(db: AutoCrawlDatabase, tmp_path: Path, *, auto_upload: bool 
         video_id="translated-title-1",
         douyin_url="https://www.douyin.com/video/translated-title-1",
         title="卷发教程来啦",
-        raw_data={"aweme_type": 0},
+        raw_data={"aweme_type": 0, "translate_enabled": True},
     )
     db.record_video(channel["id"], candidate, status="pending")
     video_file = tmp_path / "translated-title-1.mp4"
@@ -120,3 +120,43 @@ async def test_channel_can_skip_translation_and_upload_original_caption(tmp_path
     video = db.get_video(candidate.video_id)
     assert video["translated_title"] is None
     assert video["auto_upload_job_id"] == "upload-original-1"
+
+
+@pytest.mark.asyncio
+async def test_retry_legacy_video_without_translation_policy_skips_translation(tmp_path):
+    db = AutoCrawlDatabase(tmp_path / "legacy-retry.db")
+    channel = db.add_channel(
+        "https://www.douyin.com/user/legacy-retry",
+        "Kênh cũ",
+        auto_upload_enabled=True,
+        translate_enabled=True,
+    )
+    candidate = VideoCandidate(
+        video_id="legacy-retry-1",
+        douyin_url="https://www.douyin.com/video/legacy-retry-1",
+        title="Video cũ #hashtagnguon",
+        raw_data={"aweme_type": 0},
+    )
+    db.record_video(channel["id"], candidate)
+    source = tmp_path / "legacy-retry-1.mp4"
+    source.write_bytes(b"video")
+    db.update_video_downloaded(candidate.video_id, str(source), 0.001)
+    db.update_video_auto_upload(candidate.video_id, status="failed", error="Translation API request failed (HTTP 400)")
+
+    class LegacyUploader:
+        async def translate_title(self, video):
+            raise AssertionError("Video legacy không có translate_enabled phải bỏ qua dịch")
+
+        async def upload_translated(self, video, caption):
+            assert caption == "Video cũ"
+            return {"id": "legacy-retry-upload", "status": "running"}
+
+    manager = AutoCrawlManager(db=db, auto_uploader=LegacyUploader())
+    action, _ = manager.prepare_video_retry(candidate.video_id)
+    await manager.retry_video(candidate.video_id, action)
+
+    video = db.get_video(candidate.video_id)
+    assert action == "upload"
+    assert video["auto_upload_job_id"] == "legacy-retry-upload"
+    assert video["auto_upload_status"] == "running"
+    assert video["translated_title"] is None

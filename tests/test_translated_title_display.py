@@ -10,6 +10,7 @@ def completed_video(db: AutoCrawlDatabase, tmp_path: Path, *, auto_upload: bool 
         "https://www.douyin.com/user/translated-title",
         "Translated title",
         auto_upload_enabled=auto_upload,
+        translate_enabled=True,
     )
     candidate = VideoCandidate(
         video_id="translated-title-1",
@@ -84,3 +85,38 @@ async def test_retry_403_reuses_saved_translation_instead_of_translating_again(t
     assert video["auto_upload_job_id"] == "retry-upload-1"
     assert video["auto_upload_status"] == "running"
     assert video["translated_title"] == "Bản dịch đã lưu"
+
+
+@pytest.mark.asyncio
+async def test_channel_can_skip_translation_and_upload_original_caption(tmp_path):
+    db = AutoCrawlDatabase(tmp_path / "skip-translation.db")
+    channel = db.add_channel(
+        "https://www.douyin.com/user/no-translate",
+        "Kênh thường",
+        auto_upload_enabled=True,
+        translate_enabled=False,
+    )
+    candidate = VideoCandidate(
+        video_id="no-translate-1",
+        douyin_url="https://www.douyin.com/video/no-translate-1",
+        title="Nội dung thường #hashtagnguon",
+    )
+    db.record_video(channel["id"], candidate)
+    source = tmp_path / "no-translate-1.mp4"
+    source.write_bytes(b"video")
+    db.update_video_downloaded(candidate.video_id, str(source), 0.001)
+
+    class RecordingUploader:
+        async def translate_title(self, video):
+            raise AssertionError("Không được gọi dịch khi kênh tắt option translate")
+
+        async def upload_translated(self, video, caption):
+            assert caption == "Nội dung thường"
+            return {"id": "upload-original-1", "status": "running"}
+
+    manager = AutoCrawlManager(db=db, auto_uploader=RecordingUploader())
+    await manager._auto_upload_if_enabled(candidate.video_id)
+
+    video = db.get_video(candidate.video_id)
+    assert video["translated_title"] is None
+    assert video["auto_upload_job_id"] == "upload-original-1"

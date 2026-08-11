@@ -128,6 +128,7 @@ class CrawlChannelRequest(BaseModel):
     interval_minutes: int = 60
     schedule_enabled: bool = True
     auto_upload_enabled: bool = False
+    translate_enabled: bool = False
 
 
 class CrawlRunRequest(BaseModel):
@@ -140,6 +141,7 @@ class CrawlChannelStatusRequest(BaseModel):
     interval_minutes: int | None = None
     schedule_enabled: bool | None = None
     auto_upload_enabled: bool | None = None
+    translate_enabled: bool | None = None
 
 
 class CrawlVideoActionRequest(BaseModel):
@@ -247,8 +249,12 @@ async def crawl_status():
 
 
 @app.get("/api/crawl/channels")
-async def crawl_channels(status: str | None = Query(default=None)):
-    return autocrawl_manager.db.list_channels(status=status)
+async def crawl_channels(
+    status: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=8, ge=1),
+):
+    return autocrawl_manager.db.paginate_channels(page=page, page_size=page_size, status=status)
 
 
 async def _run_initial_channel_crawl(
@@ -298,6 +304,7 @@ async def crawl_add_channel(payload: CrawlChannelRequest, background_tasks: Back
             interval_minutes=payload.interval_minutes,
             schedule_enabled=payload.schedule_enabled,
             auto_upload_enabled=payload.auto_upload_enabled,
+            translate_enabled=payload.translate_enabled,
         )
         autocrawl_manager.db.update_channel(channel["id"], schedule_enabled=0, next_run_at=None)
         background_tasks.add_task(
@@ -339,6 +346,8 @@ async def crawl_update_channel(channel_id: int, payload: CrawlChannelStatusReque
             autocrawl_scheduler.start()
     if payload.auto_upload_enabled is not None:
         autocrawl_manager.db.update_channel(channel_id, auto_upload_enabled=int(payload.auto_upload_enabled))
+    if payload.translate_enabled is not None:
+        autocrawl_manager.db.update_channel(channel_id, translate_enabled=int(payload.translate_enabled))
     return autocrawl_manager.db.get_channel(channel_id)
 
 
@@ -369,13 +378,30 @@ async def crawl_scheduler_update(payload: CrawlSchedulerRequest):
 
 
 @app.get("/api/crawl/sessions")
-async def crawl_sessions(limit: int = Query(default=50, le=200)):
-    return autocrawl_manager.db.list_sessions(limit=limit)
+async def crawl_sessions(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=8, ge=1),
+):
+    return autocrawl_manager.db.paginate_sessions(page=page, page_size=page_size)
 
 
 @app.get("/api/crawl/videos")
-async def crawl_videos(limit: int = Query(default=100, le=500)):
-    return [public_video_row(row) for row in autocrawl_manager.db.list_videos(limit=limit)]
+async def crawl_videos(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=8, ge=1),
+    status: str | None = Query(default=None),
+    query: str | None = Query(default=None, max_length=120),
+    sort: str = Query(default="newest"),
+):
+    result = autocrawl_manager.db.paginate_videos(
+        page=page,
+        page_size=page_size,
+        status=status,
+        query=query,
+        sort=sort,
+    )
+    result["items"] = [public_video_row(row) for row in result["items"]]
+    return result
 
 
 @app.get("/api/crawl/videos/{video_id}/subtitle-cues")
@@ -424,8 +450,12 @@ async def crawl_delete_video(video_id: str):
 
 
 @app.get("/api/crawl/queue")
-async def crawl_queue(status: str | None = Query(default=None)):
-    return autocrawl_manager.db.list_queue(status=status)
+async def crawl_queue(
+    status: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=8, ge=1),
+):
+    return autocrawl_manager.db.paginate_queue(page=page, page_size=page_size, status=status)
 
 
 @app.post("/api/crawl/queue/process")

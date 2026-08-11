@@ -41,6 +41,56 @@ def test_autocrawl_schema_channel_crud_and_runtime_config(tmp_path):
     assert db.get_config("min_view_count") == "200"
 
 
+def test_channel_translation_option_is_persisted_per_channel(tmp_path):
+    db = AutoCrawlDatabase(tmp_path / "translation-option.db")
+
+    normal = db.add_channel("https://www.douyin.com/user/normal", "Kênh thường")
+    review = db.add_channel(
+        "https://www.douyin.com/user/review",
+        "Kênh review",
+        translate_enabled=True,
+    )
+
+    assert normal["translate_enabled"] == 0
+    assert review["translate_enabled"] == 1
+    db.update_channel(review["id"], translate_enabled=0)
+    assert db.get_channel(review["id"])["translate_enabled"] == 0
+
+
+def test_database_pagination_uses_limit_offset_and_reports_totals(tmp_path):
+    db = AutoCrawlDatabase(tmp_path / "pagination.db")
+    for index in range(19):
+        channel = db.add_channel(
+            f"https://www.douyin.com/user/channel-{index:02d}",
+            f"Kênh {index:02d}",
+        )
+        db.record_video(
+            channel["id"],
+            VideoCandidate(
+                video_id=f"video-{index:02d}",
+                douyin_url=f"https://www.douyin.com/video/video-{index:02d}",
+                title=f"Video {index:02d}",
+            ),
+        )
+
+    channels = db.paginate_channels(page=2, page_size=8)
+    videos = db.paginate_videos(page=3, page_size=8)
+
+    assert channels["pagination"] == {
+        "page": 2,
+        "page_size": 8,
+        "total": 19,
+        "total_pages": 3,
+        "has_previous": True,
+        "has_next": True,
+    }
+    assert len(channels["items"]) == 8
+    assert channels["items"][0]["display_name"] == "Kênh 10"
+    assert videos["pagination"]["page"] == 3
+    assert videos["pagination"]["total"] == 19
+    assert len(videos["items"]) == 3
+
+
 def test_channel_schedule_and_video_star_delete_are_persistent(tmp_path):
     db = AutoCrawlDatabase(tmp_path / "crawl.db")
     uid = "MS4wLjABAAAANHPWGdxB_LxCRjTLpo8E_V0dNUTjTjmEpS17RcNgmqDzFeLikmrutalyuomaWdMe"

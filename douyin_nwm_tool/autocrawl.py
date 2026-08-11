@@ -211,6 +211,9 @@ class AutoCrawlDatabase:
                 "next_run_at": "REAL",
                 "last_run_at": "REAL",
                 "auto_upload_enabled": "INTEGER NOT NULL DEFAULT 0",
+                # Preserve mandatory translation for existing rows during migration.
+                # add_channel writes an explicit opt-in value for every new row.
+                "translate_enabled": "INTEGER NOT NULL DEFAULT 1",
                 "is_deleted": "INTEGER NOT NULL DEFAULT 0",
             })
             self._ensure_columns(conn, "videos", {
@@ -232,6 +235,20 @@ class AutoCrawlDatabase:
                 "asset_count": "INTEGER NOT NULL DEFAULT 1",
                 "music_path": "TEXT",
             })
+            conn.executescript(
+                """
+                CREATE INDEX IF NOT EXISTS idx_channels_visible_status_id
+                    ON tracked_channels(is_deleted, status, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_channels_schedule_due
+                    ON tracked_channels(is_deleted, status, schedule_enabled, next_run_at, id);
+                CREATE INDEX IF NOT EXISTS idx_videos_dashboard_order
+                    ON videos(is_starred DESC, scraped_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_videos_status_dashboard_order
+                    ON videos(download_status, is_starred DESC, scraped_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_queue_status_priority_id
+                    ON download_queue(status, priority, id);
+                """
+            )
             conn.execute(
                 """UPDATE videos
                    SET download_error=(SELECT q.last_error FROM download_queue q WHERE q.video_id=videos.video_id)
@@ -264,6 +281,7 @@ class AutoCrawlDatabase:
         interval_minutes: int = 60,
         schedule_enabled: bool = True,
         auto_upload_enabled: bool = False,
+        translate_enabled: bool = False,
     ) -> dict[str, Any]:
         if "douyin.com" not in profile_url:
             raise ValueError("URL kênh phải là douyin.com")
@@ -273,14 +291,14 @@ class AutoCrawlDatabase:
             archived = conn.execute("SELECT id FROM tracked_channels WHERE profile_url=? AND is_deleted=1", (profile_url.strip(),)).fetchone()
             if archived:
                 next_run_at = time.time() + interval * 60 if schedule_enabled else None
-                conn.execute("""UPDATE tracked_channels SET display_name=?, douyin_uid=?, status='active', interval_minutes=?, schedule_enabled=?, next_run_at=?, auto_upload_enabled=?, is_deleted=0, updated_at=? WHERE id=?""", (display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled), time.time(), archived["id"]))
+                conn.execute("""UPDATE tracked_channels SET display_name=?, douyin_uid=?, status='active', interval_minutes=?, schedule_enabled=?, next_run_at=?, auto_upload_enabled=?, translate_enabled=?, is_deleted=0, updated_at=? WHERE id=?""", (display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled), int(translate_enabled), time.time(), archived["id"]))
                 row = conn.execute("SELECT * FROM tracked_channels WHERE id=?", (archived["id"],)).fetchone()
                 return dict(row) if row else {}
             cur = conn.execute(
                 """INSERT INTO tracked_channels(
-                    profile_url, display_name, douyin_uid, interval_minutes, schedule_enabled, next_run_at, auto_upload_enabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (profile_url.strip(), display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled)),
+                    profile_url, display_name, douyin_uid, interval_minutes, schedule_enabled, next_run_at, auto_upload_enabled, translate_enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (profile_url.strip(), display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled), int(translate_enabled)),
             )
             row = conn.execute("SELECT * FROM tracked_channels WHERE id=?", (cur.lastrowid,)).fetchone()
             return dict(row) if row else {}
@@ -293,6 +311,38 @@ class AutoCrawlDatabase:
                 rows = conn.execute("SELECT * FROM tracked_channels WHERE is_deleted=0 ORDER BY id DESC").fetchall()
             return [dict(r) for r in rows]
 
+    @staticmethod
+    def _pagination(page: int, page_size: int, total: int) -> tuple[int, int, int, dict[str, Any]]:
+        safe_page = max(1, int(page or 1))
+        safe_size = min(8, max(1, int(page_size or 8)))
+        total_pages = max(1, math.ceil(total / safe_size))
+        safe_page = min(safe_page, total_pages)
+        offset = (safe_page - 1) * safe_size
+        return safe_page, safe_size, offset, {
+            "page": safe_page,
+            "page_size": safe_size,
+            "total": int(total),
+            "total_pages": total_pages,
+            "has_previous": safe_page > 1,
+            "has_next": safe_page < total_pages,
+        }
+
+    def paginate_channels(self, page: int = 1, page_size: int = 8, status: str | None = None) -> dict[str, Any]:
+        with self.connection() as conn:
+            clauses = ["is_deleted=0"]
+            params: list[Any] = []
+            if status and status != "all":
+                clauses.append("status=?")
+                params.append(status)
+            where = " AND ".join(clauses)
+            total = int(conn.execute(f"SELECT COUNT(*) FROM tracked_channels WHERE {where}", params).fetchone()[0])
+            _, safe_size, offset, pagination = self._pagination(page, page_size, total)
+            rows = conn.execute(
+                f"SELECT * FROM tracked_channels WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*params, safe_size, offset),
+            ).fetchall()
+            return {"items": [dict(row) for row in rows], "pagination": pagination}
+
     def get_channel(self, channel_id: int) -> dict[str, Any] | None:
         with self.connection() as conn:
             return self._row(conn.execute("SELECT * FROM tracked_channels WHERE id=?", (channel_id,)).fetchone())
@@ -304,7 +354,7 @@ class AutoCrawlDatabase:
         self.update_channel(channel_id, status="active", error_count=0, error_message=None)
 
     def update_channel(self, channel_id: int, **fields: Any) -> None:
-        allowed = {"status", "last_scraped_at", "last_video_id", "error_count", "error_message", "douyin_uid", "metadata", "interval_minutes", "schedule_enabled", "next_run_at", "last_run_at", "auto_upload_enabled", "is_deleted"}
+        allowed = {"status", "last_scraped_at", "last_video_id", "error_count", "error_message", "douyin_uid", "metadata", "interval_minutes", "schedule_enabled", "next_run_at", "last_run_at", "auto_upload_enabled", "translate_enabled", "is_deleted"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -381,6 +431,13 @@ class AutoCrawlDatabase:
             rows = conn.execute("SELECT * FROM scraper_sessions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
             return [dict(r) for r in rows]
 
+    def paginate_sessions(self, page: int = 1, page_size: int = 8) -> dict[str, Any]:
+        with self.connection() as conn:
+            total = int(conn.execute("SELECT COUNT(*) FROM scraper_sessions").fetchone()[0])
+            _, safe_size, offset, pagination = self._pagination(page, page_size, total)
+            rows = conn.execute("SELECT * FROM scraper_sessions ORDER BY id DESC LIMIT ? OFFSET ?", (safe_size, offset)).fetchall()
+            return {"items": [dict(row) for row in rows], "pagination": pagination}
+
     def video_exists(self, video_id: str, fingerprint: str | None = None) -> bool:
         with self.connection() as conn:
             if fingerprint:
@@ -421,6 +478,42 @@ class AutoCrawlDatabase:
         with self.connection() as conn:
             rows = conn.execute("SELECT * FROM videos ORDER BY is_starred DESC, scraped_at DESC LIMIT ?", (limit,)).fetchall()
             return [dict(r) for r in rows]
+
+    def paginate_videos(
+        self,
+        page: int = 1,
+        page_size: int = 8,
+        *,
+        status: str | None = None,
+        query: str | None = None,
+        sort: str = "newest",
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status and status != "all":
+            clauses.append("v.download_status=?")
+            params.append(status)
+        cleaned_query = str(query or "").strip().lower()
+        if cleaned_query:
+            clauses.append("(LOWER(COALESCE(v.title,'')) LIKE ? OR LOWER(v.video_id) LIKE ? OR LOWER(COALESCE(c.display_name,'')) LIKE ?)")
+            needle = f"%{cleaned_query}%"
+            params.extend([needle, needle, needle])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_by = {
+            "oldest": "v.is_starred DESC, v.scraped_at ASC, v.id ASC",
+            "views": "v.is_starred DESC, v.view_count DESC, v.scraped_at DESC, v.id DESC",
+        }.get(sort, "v.is_starred DESC, v.scraped_at DESC, v.id DESC")
+        with self.connection() as conn:
+            total = int(conn.execute(
+                f"SELECT COUNT(*) FROM videos v JOIN tracked_channels c ON c.id=v.channel_id {where}",
+                params,
+            ).fetchone()[0])
+            _, safe_size, offset, pagination = self._pagination(page, page_size, total)
+            rows = conn.execute(
+                f"SELECT v.*, c.display_name AS channel_display_name, c.auto_upload_enabled AS channel_auto_upload_enabled, c.translate_enabled AS channel_translate_enabled FROM videos v JOIN tracked_channels c ON c.id=v.channel_id {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+                (*params, safe_size, offset),
+            ).fetchall()
+            return {"items": [dict(row) for row in rows], "pagination": pagination}
 
     def set_video_starred(self, video_id: str, is_starred: bool) -> dict[str, Any]:
         with self.connection() as conn:
@@ -595,6 +688,19 @@ class AutoCrawlDatabase:
                 rows = conn.execute("SELECT * FROM download_queue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
             return [dict(r) for r in rows]
 
+    def paginate_queue(self, page: int = 1, page_size: int = 8, status: str | None = None) -> dict[str, Any]:
+        with self.connection() as conn:
+            where = "WHERE status=?" if status else ""
+            params: tuple[Any, ...] = (status,) if status else ()
+            total = int(conn.execute(f"SELECT COUNT(*) FROM download_queue {where}", params).fetchone()[0])
+            _, safe_size, offset, pagination = self._pagination(page, page_size, total)
+            order_by = "priority, id" if status else "id DESC"
+            rows = conn.execute(
+                f"SELECT * FROM download_queue {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+                (*params, safe_size, offset),
+            ).fetchall()
+            return {"items": [dict(row) for row in rows], "pagination": pagination}
+
     def set_config(self, key: str, value: str) -> None:
         with self.connection() as conn:
             conn.execute("INSERT INTO system_config(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at", (key, value, time.time()))
@@ -610,10 +716,10 @@ class AutoCrawlDatabase:
                 return int(conn.execute(sql, params).fetchone()[0] or 0)
             return {
                 "channels": {
-                    "total": one("SELECT COUNT(*) FROM tracked_channels"),
-                    "active": one("SELECT COUNT(*) FROM tracked_channels WHERE status='active'"),
-                    "paused": one("SELECT COUNT(*) FROM tracked_channels WHERE status='paused'"),
-                    "error": one("SELECT COUNT(*) FROM tracked_channels WHERE status='error'"),
+                    "total": one("SELECT COUNT(*) FROM tracked_channels WHERE is_deleted=0"),
+                    "active": one("SELECT COUNT(*) FROM tracked_channels WHERE status='active' AND is_deleted=0"),
+                    "paused": one("SELECT COUNT(*) FROM tracked_channels WHERE status='paused' AND is_deleted=0"),
+                    "error": one("SELECT COUNT(*) FROM tracked_channels WHERE status='error' AND is_deleted=0"),
                 },
                 "videos": {
                     "total": one("SELECT COUNT(*) FROM videos"),
@@ -804,14 +910,22 @@ class AutoCrawlManager:
             translate_title = getattr(self.auto_uploader, "translate_title", None)
             upload_translated = getattr(self.auto_uploader, "upload_translated", None)
             if callable(translate_title) and callable(upload_translated):
-                stored_title = str(current_video.get("translated_title") or "").strip()
-                translated_title = stored_title.split("#", 1)[0].strip()
-                if translated_title and translated_title != stored_title:
-                    current_video = self.db.update_video_translated_title(video_id, translated_title)
-                if not translated_title:
-                    translated_title = str(await translate_title(current_video)).split("#", 1)[0].strip()
-                    current_video = self.db.update_video_translated_title(video_id, translated_title)
-                job = await upload_translated(current_video, translated_title)
+                if channel.get("translate_enabled"):
+                    stored_title = str(current_video.get("translated_title") or "").strip()
+                    translated_title = stored_title.split("#", 1)[0].strip()
+                    if translated_title and translated_title != stored_title:
+                        current_video = self.db.update_video_translated_title(video_id, translated_title)
+                    if not translated_title:
+                        translated_title = str(await translate_title(current_video)).split("#", 1)[0].strip()
+                        current_video = self.db.update_video_translated_title(video_id, translated_title)
+                    job = await upload_translated(current_video, translated_title)
+                else:
+                    # Skipping translation is an intentional channel policy, not
+                    # a translation failure. Source hashtags are still removed.
+                    original_caption = str(current_video.get("title") or "").split("#", 1)[0].strip()
+                    if not original_caption:
+                        original_caption = "Bài ảnh mới" if current_video.get("media_type") == "photo" else "Video mới"
+                    job = await upload_translated(current_video, original_caption)
             else:
                 job = await self.auto_uploader.upload(current_video)
                 translated_title = str(job.get("translated_title") or "").strip()

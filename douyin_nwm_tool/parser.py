@@ -51,11 +51,9 @@ class DouyinParser:
         return self._normalize_detail(aweme_id, {"aweme_detail": detail})
 
     @staticmethod
-    def _highest_quality_h264_url(video: dict[str, Any]) -> str | None:
+    def _highest_quality_video_url(video: dict[str, Any]) -> str | None:
         variants: list[tuple[tuple[int, int, int], str]] = []
         for variant in video.get("bit_rate") or []:
-            if variant.get("is_h265") or variant.get("is_bytevc1"):
-                continue
             play_addr = variant.get("play_addr") or {}
             urls = play_addr.get("url_list") or []
             if not urls:
@@ -144,7 +142,7 @@ class DouyinParser:
             raise ValueError("Không tìm thấy play_addr/uri để tạo URL tải")
 
         wm_hq = url_list[0] if url_list else None
-        nwm_hq = self._highest_quality_h264_url(video)
+        nwm_hq = self._highest_quality_video_url(video)
         if not nwm_hq:
             nwm_hq = wm_hq.replace("playwm", "play") if wm_hq else None
         nwm = f"https://aweme.snssdk.com/aweme/v1/play/?video_id={uri}&ratio=1080p&line=0" if uri else nwm_hq

@@ -5,7 +5,7 @@ from typing import Callable, Any
 from urllib.parse import urlparse
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from .parser import DouyinParser
 from .schemas import DownloadResult
@@ -183,7 +183,8 @@ class DownloadService:
                 scale = min(1.0, 1080 / reference_edge)
                 target_size = (max(1, round(width * scale)), max(1, round(height * scale)))
                 regenerate = (
-                    not target_path.exists()
+                    source_path.name.startswith("clean_")
+                    or not target_path.exists()
                     or target_path.stat().st_size <= 0
                     or target_path.stat().st_mtime_ns < source_path.stat().st_mtime_ns
                 )
@@ -197,6 +198,7 @@ class DownloadService:
                     converted = source.convert("RGB")
                     if converted.size != target_size:
                         converted = converted.resize(target_size, Image.Resampling.LANCZOS)
+                    converted = converted.filter(ImageFilter.UnsharpMask(radius=1.2, percent=45, threshold=3))
                     tmp_path = album_dir / f"tiktok_{index:02d}.webp.tmp"
                     converted.save(tmp_path, format="WEBP", quality=92, method=6)
                     tmp_path.replace(target_path)

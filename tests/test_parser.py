@@ -50,6 +50,18 @@ class FakeCrawler:
                                 "url_list": ["https://media.example/720p.mp4"],
                             },
                         },
+                        {
+                            "gear_name": "adapt_lowest_1440_1",
+                            "bit_rate": 2400000,
+                            "is_h265": 1,
+                            "is_bytevc1": 1,
+                            "play_addr": {
+                                "width": 1440,
+                                "height": 2560,
+                                "data_size": 80000000,
+                                "url_list": ["https://media.example/1440p-h265.mp4"],
+                            },
+                        },
                     ],
                 },
             }
@@ -67,7 +79,7 @@ async def test_parse_douyin_video_returns_minimal_no_watermark_urls():
     assert result.video_id == "123"
     assert result.desc == "demo video"
     assert result.video_data.nwm_video_url == "https://aweme.snssdk.com/aweme/v1/play/?video_id=v0200abc&ratio=1080p&line=0"
-    assert result.video_data.nwm_video_url_HQ == "https://media.example/720p.mp4"
+    assert result.video_data.nwm_video_url_HQ == "https://media.example/1440p-h265.mp4"
     assert "playwm" not in result.video_data.nwm_video_url_HQ
 
 

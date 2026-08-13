@@ -141,6 +141,9 @@ async def test_download_photo_post_saves_ordered_images_music_and_manifest(tmp_p
         assert first.size == (1080, 1440)
     with Image.open(album_dir / "tiktok_02.webp") as second:
         assert second.size == (1440, 1080)
+    with Image.open(BytesIO(source_one)) as original, Image.open(album_dir / "tiktok_01.webp") as enhanced:
+        baseline = original.convert("RGB").resize((1080, 1440), Image.Resampling.LANCZOS)
+        assert enhanced.convert("RGB").tobytes() != baseline.tobytes()
     assert manifest["music_title"] == "凌风(宿命版)"
     assert manifest["music_file"] == "music.mp3"
 

@@ -73,8 +73,7 @@ def ensure_tiktok_video_asset(
     probe = probe_video(source, runner=runner)
     if not should_enhance_video(probe):
         return source
-    target_dir = source.parent / "enhanced"
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = source.parent
     target = target_dir / f"{source.stem}_tiktok_hq.mp4"
     if target.exists() and target.stat().st_size > 0 and target.stat().st_mtime_ns >= source.stat().st_mtime_ns:
         return target

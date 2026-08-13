@@ -384,7 +384,7 @@ class AutoCrawlDatabase:
         with self.connection() as conn:
             rows = conn.execute(
                 """SELECT * FROM tracked_channels
-                   WHERE status='active' AND schedule_enabled=1 AND is_deleted=0
+                   WHERE status IN ('active','error') AND schedule_enabled=1 AND is_deleted=0
                      AND (next_run_at IS NULL OR next_run_at<=?)
                    ORDER BY COALESCE(next_run_at, 0), id""",
                 (current,),
@@ -1060,7 +1060,10 @@ class AutoCrawlManager:
                 fail += 1
                 error_message = str(exc)
                 count = int(channel.get("error_count") or 0) + 1
-                status = "paused" if count >= self.config.max_channel_retries else "error"
+                # A scheduled crawl is continuous by definition. Transient
+                # provider failures remain visible as ``error`` but must not
+                # silently become ``paused`` and disappear from future runs.
+                status = "error"
                 self.db.update_channel(channel["id"], status=status, error_count=count, error_message=error_message, last_scraped_at=time.time())
             self.db.update_session_progress(
                 session_id,
@@ -1170,7 +1173,11 @@ class AutoCrawlScheduler:
         self._task: asyncio.Task | None = None
 
     def status(self) -> dict[str, Any]:
-        scheduled = [row for row in self.manager.db.list_channels(status="active") if row.get("schedule_enabled")]
+        scheduled = [
+            row
+            for row in self.manager.db.list_channels()
+            if row.get("status") in {"active", "error"} and row.get("schedule_enabled")
+        ]
         due_times = [row.get("next_run_at") for row in scheduled if row.get("next_run_at")]
         effective_next_run = min(due_times) if due_times else self.next_run_at
         countdown = None
@@ -1211,7 +1218,7 @@ class AutoCrawlScheduler:
         return self.status()
 
     async def run_due_channels(self) -> dict[str, Any]:
-        due = self.manager.db.list_due_channels()
+        due = self.manager.db.list_due_channels()[:1]
         completed = failed = 0
         results = []
         for channel in due:
@@ -1234,7 +1241,13 @@ class AutoCrawlScheduler:
 
     async def _loop(self) -> None:
         while self.enabled:
-            due_times = [row.get("next_run_at") for row in self.manager.db.list_channels(status="active") if row.get("schedule_enabled") and row.get("next_run_at")]
+            due_times = [
+                row.get("next_run_at")
+                for row in self.manager.db.list_channels()
+                if row.get("status") in {"active", "error"}
+                and row.get("schedule_enabled")
+                and row.get("next_run_at")
+            ]
             self.next_run_at = min(due_times) if due_times else time.time() + 30
             await asyncio.sleep(30)
             if not self.enabled:

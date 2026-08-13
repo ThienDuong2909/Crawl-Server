@@ -31,6 +31,98 @@ def test_per_channel_scheduler_runs_only_due_jobs_and_reschedules(tmp_path):
     assert db.get_channel(disabled["id"])["last_run_at"] is None
 
 
+def test_scheduler_processes_only_one_overdue_channel_per_tick(tmp_path):
+    from douyin_nwm_tool.autocrawl import AutoCrawlDatabase, AutoCrawlScheduler
+
+    db = AutoCrawlDatabase(tmp_path / "paced-overdue.db")
+    first = db.add_channel("https://www.douyin.com/user/first", "First", schedule_enabled=True)
+    second = db.add_channel("https://www.douyin.com/user/second", "Second", schedule_enabled=True)
+    past = time.time() - 10
+    db.update_channel(first["id"], next_run_at=past - 1)
+    db.update_channel(second["id"], next_run_at=past)
+
+    class FakeManager:
+        def __init__(self):
+            self.db = db
+            self.calls = []
+
+        async def run_once(self, channel_id=None, download=True):
+            self.calls.append(channel_id)
+            return {"status": "completed", "channel_id": channel_id}
+
+    manager = FakeManager()
+    scheduler = AutoCrawlScheduler(manager)
+
+    result = asyncio.run(scheduler.run_due_channels())
+
+    assert result == {"processed": 1, "completed": 1, "failed": 0}
+    assert manager.calls == [first["id"]]
+    assert db.get_channel(second["id"])["last_run_at"] is None
+
+
+def test_scheduler_retries_due_error_channel_but_never_runs_paused_channel(tmp_path):
+    from douyin_nwm_tool.autocrawl import AutoCrawlDatabase
+
+    db = AutoCrawlDatabase(tmp_path / "recover-error-channel.db")
+    retryable = db.add_channel(
+        "https://www.douyin.com/user/retryable",
+        "Retryable",
+        interval_minutes=60,
+        schedule_enabled=True,
+    )
+    paused = db.add_channel(
+        "https://www.douyin.com/user/paused",
+        "Paused",
+        interval_minutes=60,
+        schedule_enabled=True,
+    )
+    now = time.time()
+    db.update_channel(
+        retryable["id"],
+        status="error",
+        error_count=1,
+        error_message="HTTP trạng thái 403",
+        next_run_at=now - 10,
+    )
+    db.update_channel(paused["id"], status="paused", next_run_at=now - 10)
+
+    due_ids = [row["id"] for row in db.list_due_channels(now=now)]
+
+    assert retryable["id"] in due_ids
+    assert paused["id"] not in due_ids
+
+
+def test_recurring_channel_stays_retryable_after_repeated_provider_errors(tmp_path):
+    from douyin_nwm_tool.autocrawl import AutoCrawlConfig, AutoCrawlDatabase, AutoCrawlManager
+
+    db = AutoCrawlDatabase(tmp_path / "repeated-errors.db")
+    channel = db.add_channel(
+        "https://www.douyin.com/user/flaky",
+        "Flaky",
+        interval_minutes=1,
+        schedule_enabled=True,
+    )
+
+    class AlwaysForbiddenProvider:
+        async def fetch_channel_videos(self, channel, config):
+            raise RuntimeError("HTTP trạng thái 403")
+
+    manager = AutoCrawlManager(
+        db=db,
+        provider=AlwaysForbiddenProvider(),
+        config=AutoCrawlConfig(max_channel_retries=3),
+    )
+
+    for _ in range(4):
+        result = asyncio.run(manager.run_once(channel_id=channel["id"], download=False))
+        assert result["status"] == "failed"
+
+    failed_channel = db.get_channel(channel["id"])
+    assert failed_channel["status"] == "error"
+    db.update_channel(channel["id"], next_run_at=time.time() - 1)
+    assert [row["id"] for row in db.list_due_channels()] == [channel["id"]]
+
+
 def test_autocrawl_scheduler_status_start_stop(monkeypatch, tmp_path):
     from douyin_nwm_tool import main
     from douyin_nwm_tool.autocrawl import AutoCrawlDatabase, AutoCrawlManager

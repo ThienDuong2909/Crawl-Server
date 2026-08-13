@@ -1,4 +1,7 @@
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 
 from fastapi.testclient import TestClient
 
@@ -93,6 +96,42 @@ def test_upload_service_rejects_path_traversal(monkeypatch, tmp_path):
     )
 
     assert resp.status_code == 400
+
+
+def test_upload_jobs_are_processed_one_at_a_time(tmp_path, monkeypatch):
+    from tiktok_upload_service import main
+
+    video_dir = tmp_path / "douyin_video"
+    video_dir.mkdir(parents=True)
+    for name in ("douyin_one.mp4", "douyin_two.mp4"):
+        (video_dir / name).write_bytes(b"video")
+    monkeypatch.setattr(main.settings, "download_dir", tmp_path)
+    monkeypatch.setattr(main.settings, "data_dir", tmp_path / "data")
+    monkeypatch.setenv("TIKTOK_UPLOAD_MODE", "dry_run")
+
+    class SerialAdapter:
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def upload(self, *, video_path, account, caption, options):
+            with self.lock:
+                type(self).active += 1
+                type(self).max_active = max(type(self).max_active, type(self).active)
+            time.sleep(0.03)
+            with self.lock:
+                type(self).active -= 1
+            return {"mode": "test", "ok": True}
+
+    adapter = SerialAdapter()
+    manager = main.UploadJobManager(adapter=adapter)
+    def create(filename):
+        return manager.create_and_run(main.UploadJobRequest(filename=filename, account="a", caption="c"))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = list(pool.map(create, ["douyin_one.mp4", "douyin_two.mp4"]))
+    assert all(job.status == "success" for job in jobs)
+    assert adapter.max_active == 1
 
 
 def test_ayrshare_mode_auto_publishes_public_video_without_exposing_api_key(tmp_path, monkeypatch):
@@ -237,6 +276,49 @@ def test_inbox_mode_initializes_and_uploads_video_for_user_review(tmp_path, monk
     assert upload["headers"]["Content-Type"] == "video/mp4"
     assert upload["headers"]["Content-Length"] == str(len(video_bytes))
     assert upload["headers"]["Content-Range"] == f"bytes 0-{len(video_bytes)-1}/{len(video_bytes)}"
+
+
+def test_inbox_mode_preserves_tiktok_daily_cap_error_without_uploading(tmp_path, monkeypatch):
+    from tiktok_upload_service import main
+
+    video_dir = tmp_path / "douyin_video"
+    video_dir.mkdir()
+    (video_dir / "douyin_capped.mp4").write_bytes(b"video-bytes")
+    monkeypatch.setattr(main.settings, "download_dir", tmp_path)
+    monkeypatch.setattr(main.settings, "data_dir", tmp_path / "data")
+    main.job_manager.reset()
+    main.job_manager.adapter = main.TikTokUploadAdapter()
+    monkeypatch.setenv("TIKTOK_UPLOAD_MODE", "inbox")
+    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda: {"access_token": "secret-token"})
+
+    class CappedResponse:
+        status_code = 400
+        text = '{"error":{"code":"spam_risk_too_many_pending_share","message":"spam_risk_too_many_pending_share","log_id":"log-cap-123"}}'
+
+        def json(self):
+            return {
+                "error": {
+                    "code": "spam_risk_too_many_pending_share",
+                    "message": "spam_risk_too_many_pending_share",
+                    "log_id": "log-cap-123",
+                }
+            }
+
+        def raise_for_status(self):
+            raise AssertionError("structured TikTok errors must be handled before raise_for_status")
+
+    monkeypatch.setattr(main.httpx, "post", lambda *args, **kwargs: CappedResponse())
+    monkeypatch.setattr(main.httpx, "put", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not upload after rejected init")))
+
+    body = TestClient(main.app).post("/api/upload/jobs", json={
+        "filename": "douyin_capped.mp4", "account": "main_tiktok", "caption": "caption",
+    }).json()
+
+    assert body["status"] == "failed"
+    assert "đã đạt giới hạn upload API trong ngày" in body["error"]
+    assert "spam_risk_too_many_pending_share" in body["error"]
+    assert "log-cap-123" in body["error"]
+    assert "secret-token" not in str(body)
 
 
 def test_inbox_mode_fails_closed_when_oauth_token_is_unavailable(tmp_path, monkeypatch):

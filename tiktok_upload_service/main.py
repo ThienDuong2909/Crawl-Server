@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -297,11 +298,23 @@ class TikTokUploadAdapter:
                 },
                 timeout=60,
             )
-            init_response.raise_for_status()
-            init_payload = init_response.json()
+            try:
+                init_payload = init_response.json()
+            except ValueError:
+                init_payload = {}
             init_error = init_payload.get("error") or {}
-            if init_error.get("code") not in {None, "", "ok"}:
-                raise RuntimeError(f"TikTok Inbox init failed: {init_error.get('code')}: {init_error.get('message') or ''}")
+            init_code = str(init_error.get("code") or "")
+            init_message = str(init_error.get("message") or "")
+            init_log_id = str(init_error.get("log_id") or "")
+            if init_response.status_code >= 400 or init_code not in {"", "ok"}:
+                if init_code == "spam_risk_too_many_pending_share":
+                    explanation = "TikTok đã đạt giới hạn upload API trong ngày; cần xử lý/đăng các bản nháp đang chờ và đợi TikTok mở lại hạn mức"
+                else:
+                    explanation = init_message or f"HTTP {init_response.status_code}"
+                details = f"TikTok Inbox init failed: {init_code or 'http_error'}: {explanation}"
+                if init_log_id:
+                    details += f" (log_id={init_log_id})"
+                raise RuntimeError(details)
             init_data = init_payload.get("data") or {}
             publish_id = str(init_data.get("publish_id") or "")
             upload_url = str(init_data.get("upload_url") or "")
@@ -380,6 +393,9 @@ class UploadJobManager:
     def __init__(self, adapter: TikTokUploadAdapter | None = None):
         self.adapter = adapter or TikTokUploadAdapter()
         self.jobs: dict[str, UploadJob] = {}
+        # Serialize the external TikTok upload critical section. Multiple API
+        # requests can arrive concurrently from auto-crawl and bulk actions.
+        self._upload_lock = threading.Lock()
 
     def reset(self):
         self.jobs.clear()
@@ -399,8 +415,10 @@ class UploadJobManager:
 
     def _run(self, job: UploadJob, video_path: Path):
         try:
-            self._update(job, status="running", progress=20, message="Preparing video for TikTok upload")
-            result = self.adapter.upload(video_path=video_path, account=job.account, caption=job.caption, options=job.options)
+            self._update(job, status="queued", progress=0, message="Queued for serial TikTok upload")
+            with self._upload_lock:
+                self._update(job, status="running", progress=20, message="Preparing video for TikTok upload")
+                result = self.adapter.upload(video_path=video_path, account=job.account, caption=job.caption, options=job.options)
             workflow_status = str(result.get("workflow_status") or "success")
             message = str(result.get("message") or "Completed")
             self._update(job, status=workflow_status, progress=100, message=message, result=result)
@@ -871,7 +889,8 @@ async def get_photo(photo_id: str, filename: str):
 
 @app.post("/api/upload/photo-jobs")
 async def create_photo_job(payload: PhotoUploadJobRequest):
-    return create_photo_upload_job(payload).to_dict()
+    with job_manager._upload_lock:
+        return create_photo_upload_job(payload).to_dict()
 
 
 @app.post("/api/upload/jobs")

@@ -817,9 +817,9 @@ class TikTokAutoUploader:
             }
             target_endpoint = self.endpoint
         if self.client is not None:
-            response = await self.client.post(target_endpoint, json=payload, timeout=90)
+            response = await self.client.post(target_endpoint, json=payload, timeout=900)
         else:
-            async with httpx.AsyncClient(timeout=90) as client:
+            async with httpx.AsyncClient(timeout=900) as client:
                 response = await client.post(target_endpoint, json=payload)
         response.raise_for_status()
         result = response.json()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import secrets
 import threading
 import time
@@ -389,16 +390,68 @@ class TikTokUploadAdapter:
         raise RuntimeError(f"Unsupported TIKTOK_UPLOAD_MODE={mode!r}; use dry_run or ayrshare")
 
 
+class TikTokUploadGate:
+    def __init__(
+        self,
+        min_interval_seconds: int | None = None,
+        max_interval_seconds: int | None = None,
+        *,
+        clock=time.monotonic,
+        sleeper=time.sleep,
+        choose_interval=random.uniform,
+    ):
+        configured_min = int(os.getenv("TIKTOK_UPLOAD_MIN_INTERVAL_SECONDS", "60")) if min_interval_seconds is None else int(min_interval_seconds)
+        configured_max = int(os.getenv("TIKTOK_UPLOAD_MAX_INTERVAL_SECONDS", "120")) if max_interval_seconds is None else int(max_interval_seconds)
+        self.min_interval_seconds = max(0, configured_min)
+        self.max_interval_seconds = max(self.min_interval_seconds, configured_max)
+        self.clock = clock
+        self.sleeper = sleeper
+        self.choose_interval = choose_interval
+        self.condition = threading.Condition()
+        self.lock = self.condition
+        self.last_finished_at: float | None = None
+        self.next_ticket = 0
+        self.serving_ticket = 0
+
+    def run(self, operation, *, enforce_cooldown: bool = True):
+        with self.condition:
+            ticket = self.next_ticket
+            self.next_ticket += 1
+            while ticket != self.serving_ticket:
+                self.condition.wait()
+            if enforce_cooldown and self.last_finished_at is not None:
+                interval = float(self.choose_interval(self.min_interval_seconds, self.max_interval_seconds))
+                remaining = interval - (self.clock() - self.last_finished_at)
+                if remaining > 0:
+                    self.sleeper(remaining)
+            try:
+                return operation()
+            finally:
+                if enforce_cooldown:
+                    self.last_finished_at = self.clock()
+                self.serving_ticket += 1
+                self.condition.notify_all()
+
+
 class UploadJobManager:
-    def __init__(self, adapter: TikTokUploadAdapter | None = None):
+    def __init__(self, adapter: TikTokUploadAdapter | None = None, upload_gate: TikTokUploadGate | None = None):
         self.adapter = adapter or TikTokUploadAdapter()
         self.jobs: dict[str, UploadJob] = {}
-        # Serialize the external TikTok upload critical section. Multiple API
-        # requests can arrive concurrently from auto-crawl and bulk actions.
-        self._upload_lock = threading.Lock()
+        # One FIFO gate is shared by video and photo jobs. It serializes the
+        # complete external upload and enforces a cooldown before the next init.
+        self.upload_gate = upload_gate or TikTokUploadGate()
+        self._upload_lock = self.upload_gate.lock
 
     def reset(self):
         self.jobs.clear()
+        self.upload_gate.last_finished_at = None
+        self.upload_gate.next_ticket = 0
+        self.upload_gate.serving_ticket = 0
+
+    @staticmethod
+    def _cooldown_enabled() -> bool:
+        mode = os.getenv("TIKTOK_UPLOAD_MODE", settings.upload_mode).strip() or "dry_run"
+        return mode != "dry_run"
 
     def create_and_run(self, payload: UploadJobRequest) -> UploadJob:
         video_path = resolve_video_path(payload.filename)
@@ -416,9 +469,10 @@ class UploadJobManager:
     def _run(self, job: UploadJob, video_path: Path):
         try:
             self._update(job, status="queued", progress=0, message="Queued for serial TikTok upload")
-            with self._upload_lock:
+            def execute_upload():
                 self._update(job, status="running", progress=20, message="Preparing video for TikTok upload")
-                result = self.adapter.upload(video_path=video_path, account=job.account, caption=job.caption, options=job.options)
+                return self.adapter.upload(video_path=video_path, account=job.account, caption=job.caption, options=job.options)
+            result = self.upload_gate.run(execute_upload, enforce_cooldown=self._cooldown_enabled())
             workflow_status = str(result.get("workflow_status") or "success")
             message = str(result.get("message") or "Completed")
             self._update(job, status=workflow_status, progress=100, message=message, result=result)
@@ -803,7 +857,18 @@ def create_n8n_publish_job(payload: UploadJobRequest) -> UploadJob:
 async def health():
     mode = os.getenv("TIKTOK_UPLOAD_MODE", settings.upload_mode).strip() or "dry_run"
     provider_ready = bool(TikTokUploadAdapter._read_secret("ayrshare_api_key.txt")) if mode == "ayrshare" else True
-    return {"status": "ok", "service": "tiktok-uploader", "mode": mode, "provider_ready": provider_ready}
+    return {
+        "status": "ok",
+        "service": "tiktok-uploader",
+        "mode": mode,
+        "provider_ready": provider_ready,
+        "queue": {
+            "serial": True,
+            "min_interval_seconds": job_manager.upload_gate.min_interval_seconds,
+            "max_interval_seconds": job_manager.upload_gate.max_interval_seconds,
+            "waiting": max(0, job_manager.upload_gate.next_ticket - job_manager.upload_gate.serving_ticket),
+        },
+    }
 
 
 @app.get("/api/account/tiktok/status")
@@ -888,13 +953,15 @@ async def get_photo(photo_id: str, filename: str):
 
 
 @app.post("/api/upload/photo-jobs")
-async def create_photo_job(payload: PhotoUploadJobRequest):
-    with job_manager._upload_lock:
-        return create_photo_upload_job(payload).to_dict()
+def create_photo_job(payload: PhotoUploadJobRequest):
+    return job_manager.upload_gate.run(
+        lambda: create_photo_upload_job(payload),
+        enforce_cooldown=job_manager._cooldown_enabled(),
+    ).to_dict()
 
 
 @app.post("/api/upload/jobs")
-async def create_upload_job(payload: UploadJobRequest):
+def create_upload_job(payload: UploadJobRequest):
     mode = os.getenv("TIKTOK_UPLOAD_MODE", settings.upload_mode).strip() or "dry_run"
     if mode == "n8n":
         return create_n8n_publish_job(payload).to_dict()

@@ -62,6 +62,8 @@ services:
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://nwm.thienne.io.vn}
       TIKTOK_N8N_WEBHOOK_URL: ${TIKTOK_N8N_WEBHOOK_URL:-https://n8n.thienne.io.vn/webhook/tiktok-upload}
       TIKTOK_REDIRECT_URI: ${TIKTOK_REDIRECT_URI:-https://nwm.thienne.io.vn/api/tiktok/callback}
+      TIKTOK_UPLOAD_MIN_INTERVAL_SECONDS: ${TIKTOK_UPLOAD_MIN_INTERVAL_SECONDS:-60}
+      TIKTOK_UPLOAD_MAX_INTERVAL_SECONDS: ${TIKTOK_UPLOAD_MAX_INTERVAL_SECONDS:-120}
       TIKTOK_OAUTH_CONFIG_FILE: /app/secrets/tiktok_dev_oauth.json
     volumes:
       - ./download:/shared/download

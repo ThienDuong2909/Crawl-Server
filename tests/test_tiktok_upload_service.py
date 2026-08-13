@@ -98,6 +98,47 @@ def test_upload_service_rejects_path_traversal(monkeypatch, tmp_path):
     assert resp.status_code == 400
 
 
+def test_upload_queue_waits_60_to_120_seconds_between_tiktok_jobs(tmp_path, monkeypatch):
+    from tiktok_upload_service import main
+
+    video_dir = tmp_path / "douyin_video"
+    video_dir.mkdir(parents=True)
+    for name in ("douyin_one.mp4", "douyin_two.mp4"):
+        (video_dir / name).write_bytes(b"video")
+    monkeypatch.setattr(main.settings, "download_dir", tmp_path)
+    monkeypatch.setattr(main.settings, "data_dir", tmp_path / "data")
+
+    now = [1000.0]
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    gate = main.TikTokUploadGate(
+        min_interval_seconds=60,
+        max_interval_seconds=120,
+        clock=lambda: now[0],
+        sleeper=fake_sleep,
+        choose_interval=lambda low, high: 75,
+    )
+
+    class Adapter:
+        def upload(self, **kwargs):
+            return {"mode": "inbox", "ok": True, "workflow_status": "awaiting_user_review"}
+
+    manager = main.UploadJobManager(adapter=Adapter(), upload_gate=gate)
+    monkeypatch.setenv("TIKTOK_UPLOAD_MODE", "inbox")
+    first = manager.create_and_run(main.UploadJobRequest(filename="douyin_one.mp4", account="a", caption="c"))
+    second = manager.create_and_run(main.UploadJobRequest(filename="douyin_two.mp4", account="a", caption="c"))
+
+    assert first.status == "awaiting_user_review"
+    assert second.status == "awaiting_user_review"
+    assert sleeps == [75]
+    assert gate.min_interval_seconds == 60
+    assert gate.max_interval_seconds == 120
+
+
 def test_upload_jobs_are_processed_one_at_a_time(tmp_path, monkeypatch):
     from tiktok_upload_service import main
 

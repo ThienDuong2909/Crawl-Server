@@ -52,8 +52,16 @@ class DouyinParser:
 
     @staticmethod
     def _highest_quality_video_url(video: dict[str, Any]) -> str | None:
+        """Select the best browser-compatible AVC/H.264 source.
+
+        Douyin often lists higher-resolution HEVC/ByteVC1 variants first. Those
+        files contain valid frames but render as black/audio-only in browsers
+        without HEVC support, so dashboard media must prefer AVC.
+        """
         variants: list[tuple[tuple[int, int, int], str]] = []
         for variant in video.get("bit_rate") or []:
+            if variant.get("is_h265") or variant.get("is_bytevc1"):
+                continue
             play_addr = variant.get("play_addr") or {}
             urls = play_addr.get("url_list") or []
             if not urls:

@@ -79,7 +79,7 @@ async def test_parse_douyin_video_returns_minimal_no_watermark_urls():
     assert result.video_id == "123"
     assert result.desc == "demo video"
     assert result.video_data.nwm_video_url == "https://aweme.snssdk.com/aweme/v1/play/?video_id=v0200abc&ratio=1080p&line=0"
-    assert result.video_data.nwm_video_url_HQ == "https://media.example/1440p-h265.mp4"
+    assert result.video_data.nwm_video_url_HQ == "https://media.example/720p.mp4"
     assert "playwm" not in result.video_data.nwm_video_url_HQ
 
 

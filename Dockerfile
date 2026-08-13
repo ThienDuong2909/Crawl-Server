@@ -2,6 +2,9 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 DOWNLOAD_DIR=/app/download DOUYIN_COOKIE_FILE=/app/secrets/douyin_cookie.txt PORT=8000
 WORKDIR /app
 RUN groupadd -r app && useradd -r -g app app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml README.md COOKIE_AUTO_REFRESH.md ./
 COPY douyin_nwm_tool ./douyin_nwm_tool
 COPY crawlers ./crawlers

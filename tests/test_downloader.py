@@ -55,14 +55,27 @@ class FakeHttpClient:
 
 @pytest.mark.asyncio
 async def test_download_saves_no_watermark_video_atomically(tmp_path: Path):
-    service = DownloadService(parser=FakeParser(), download_dir=tmp_path, http_client=FakeHttpClient())
+    enhanced_calls = []
+
+    def enhancer(path):
+        enhanced_calls.append(path)
+        target = path.with_name(f"{path.stem}_tiktok_hq.mp4")
+        target.write_bytes(path.read_bytes() + b"-enhanced")
+        return target
+
+    service = DownloadService(
+        parser=FakeParser(), download_dir=tmp_path, http_client=FakeHttpClient(),
+        enhance_video=True, video_enhancer=enhancer,
+    )
 
     result = await service.download("https://www.douyin.com/video/123")
 
-    assert result.video_id == "123"
-    assert result.file_path == tmp_path / "douyin_video" / "douyin_123.mp4"
-    assert result.file_path.read_bytes() == b"abc123"
-    assert not result.file_path.with_suffix(".mp4.tmp").exists()
+    source = tmp_path / "douyin_video" / "douyin_123.mp4"
+    assert enhanced_calls == [source]
+    assert result.file_path == tmp_path / "douyin_video" / "douyin_123_tiktok_hq.mp4"
+    assert source.read_bytes() == b"abc123"
+    assert result.file_path.read_bytes() == b"abc123-enhanced"
+    assert not source.with_suffix(".mp4.tmp").exists()
 
 
 @pytest.mark.asyncio
@@ -219,7 +232,7 @@ async def test_cached_watermarked_photo_is_preserved_and_clean_variant_feeds_tik
 
 @pytest.mark.asyncio
 async def test_download_reports_byte_progress(tmp_path: Path):
-    service = DownloadService(parser=FakeParser(), download_dir=tmp_path, http_client=FakeHttpClient())
+    service = DownloadService(parser=FakeParser(), download_dir=tmp_path, http_client=FakeHttpClient(), enhance_video=False)
     events = []
 
     await service.download("https://www.douyin.com/video/123", progress_callback=events.append)

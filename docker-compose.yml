@@ -1,4 +1,16 @@
 services:
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: douyin-tiktok-frontend
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      - douyin-downloader
+      - tiktok-uploader
+
   douyin-downloader:
     build:
       context: .
@@ -9,28 +21,27 @@ services:
       - "127.0.0.1:8000:8000"
     environment:
       DOWNLOAD_DIR: /shared/download
+      MEDIA_ENHANCE_VIDEO: ${MEDIA_ENHANCE_VIDEO:-1}
       DOUYIN_COOKIE_FILE: /app/secrets/douyin_cookie.txt
-      AGENTROUTER_API_KEY_FILE: /app/secrets/agentrouter_api_key.txt
-      AGENTROUTER_BASE_URL: ${AGENTROUTER_BASE_URL:-https://agentrouter.org/v1}
-      AGENTROUTER_MODEL: ${AGENTROUTER_MODEL:-}
-      AGENTROUTER_CLIENT_USER_AGENT: ${AGENTROUTER_CLIENT_USER_AGENT:-Crawl-Server}
-      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
       COOKIE_UPDATE_TOKEN: ${COOKIE_UPDATE_TOKEN:-}
-      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-60}
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:-}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-0}
+      TIKTOK_UPLOAD_SERVICE_URL: http://tiktok-uploader:8001
+      AGENTROUTER_API_KEY_FILE: /app/secrets/agentrouter_api_key.txt
+      AGENTROUTER_BASE_URL: https://agentrouter.org/v1
+      AGENTROUTER_MODEL: claude-opus-5
+      AGENTROUTER_CLIENT_USER_AGENT: Kilo-Code/4.110.0
       AUTO_CRAWL_DB_PATH: /app/data/autocrawl.db
-      AUTO_CRAWL_SCHEDULER_ENABLED: ${AUTO_CRAWL_SCHEDULER_ENABLED:-false}
-      AUTO_CRAWL_INTERVAL_MINUTES: ${AUTO_CRAWL_INTERVAL_MINUTES:-60}
       AUTO_CRAWL_CHANNELS_PER_BATCH: ${AUTO_CRAWL_CHANNELS_PER_BATCH:-20}
       AUTO_CRAWL_MAX_VIDEOS_PER_CHANNEL: ${AUTO_CRAWL_MAX_VIDEOS_PER_CHANNEL:-20}
       AUTO_CRAWL_MAX_VIDEO_AGE_HOURS: ${AUTO_CRAWL_MAX_VIDEO_AGE_HOURS:-72}
       AUTO_CRAWL_MIN_VIEW_COUNT: ${AUTO_CRAWL_MIN_VIEW_COUNT:-0}
       AUTO_CRAWL_MIN_LIKE_COUNT: ${AUTO_CRAWL_MIN_LIKE_COUNT:-0}
-      AUTO_CRAWL_MAX_CHANNEL_RETRIES: ${AUTO_CRAWL_MAX_CHANNEL_RETRIES:-3}
-      AUTO_CRAWL_DOWNLOAD_NEW: ${AUTO_CRAWL_DOWNLOAD_NEW:-true}
-      TIKTOK_UPLOAD_SERVICE_URL: http://tiktok-uploader:8001
+      AUTO_CRAWL_SCHEDULER_ENABLED: ${AUTO_CRAWL_SCHEDULER_ENABLED:-false}
+      AUTO_CRAWL_INTERVAL_MINUTES: ${AUTO_CRAWL_INTERVAL_MINUTES:-60}
     volumes:
       - ./download:/shared/download
-      - ./secrets:/app/secrets:ro
+      - ./secrets:/app/secrets
       - ./douyin_crawl_data:/app/data
     depends_on:
       - tiktok-uploader
@@ -47,11 +58,11 @@ services:
       DOWNLOAD_DIR: /shared/download
       TIKTOK_UPLOAD_DATA_DIR: /app/data
       SECRETS_DIR: /app/secrets
+      TIKTOK_UPLOAD_MODE: ${TIKTOK_UPLOAD_MODE:-n8n}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://nwm.thienne.io.vn}
+      TIKTOK_N8N_WEBHOOK_URL: ${TIKTOK_N8N_WEBHOOK_URL:-https://n8n.thienne.io.vn/webhook/tiktok-upload}
+      TIKTOK_REDIRECT_URI: ${TIKTOK_REDIRECT_URI:-https://nwm.thienne.io.vn/api/tiktok/callback}
       TIKTOK_OAUTH_CONFIG_FILE: /app/secrets/tiktok_dev_oauth.json
-      TIKTOK_UPLOAD_MODE: ${TIKTOK_UPLOAD_MODE:-dry_run}
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://your-domain.example}
-      TIKTOK_REDIRECT_URI: ${TIKTOK_REDIRECT_URI:-https://your-domain.example/api/tiktok/callback}
-      TIKTOK_N8N_WEBHOOK_URL: ${TIKTOK_N8N_WEBHOOK_URL:-}
     volumes:
       - ./download:/shared/download
       - ./tiktok_upload_data:/app/data

@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 import httpx
 from PIL import Image, ImageFilter
 
+from .media_quality import ensure_tiktok_video_asset
 from .parser import DouyinParser
 from .schemas import DownloadResult
 
@@ -16,10 +17,22 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class DownloadService:
-    def __init__(self, parser: DouyinParser | None = None, download_dir: str | Path | None = None, http_client=None):
+    def __init__(
+        self,
+        parser: DouyinParser | None = None,
+        download_dir: str | Path | None = None,
+        http_client=None,
+        *,
+        enhance_video: bool | None = None,
+        video_enhancer=ensure_tiktok_video_asset,
+    ):
         self.parser = parser or DouyinParser()
         self.download_dir = Path(download_dir or os.getenv("DOWNLOAD_DIR", "./download")).resolve()
         self.http_client = http_client
+        if enhance_video is None:
+            enhance_video = os.getenv("MEDIA_ENHANCE_VIDEO", "1").strip().lower() not in {"0", "false", "no", "off"}
+        self.enhance_video = enhance_video
+        self.video_enhancer = video_enhancer
 
     async def download(self, url: str, progress_callback: ProgressCallback | None = None, raw_detail: dict[str, Any] | None = None) -> DownloadResult:
         parsed = await self.parser.parse_detail(url, raw_detail) if raw_detail is not None else await self.parser.parse(url)
@@ -34,16 +47,22 @@ class DownloadService:
         self._emit(progress_callback, phase="parsed", video_id=parsed.video_id, progress=15)
 
         if file_path.exists() and file_path.stat().st_size > 0:
-            size = file_path.stat().st_size
+            upload_path = self.video_enhancer(file_path) if self.enhance_video else file_path
+            size = upload_path.stat().st_size
             self._emit(progress_callback, phase="completed", video_id=parsed.video_id, progress=100, bytes_written=size, total_bytes=size, cached=True)
-            return DownloadResult(video_id=parsed.video_id, file_path=file_path, source_url=source_url, bytes_written=size)
+            return DownloadResult(video_id=parsed.video_id, file_path=upload_path, source_url=source_url, bytes_written=size)
 
         tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
         headers = {"User-Agent": DEFAULT_USER_AGENT, "Referer": "https://www.douyin.com/"}
         bytes_written = await self._stream_to_file(source_url, tmp_path, headers, progress_callback=progress_callback, video_id=parsed.video_id)
         tmp_path.replace(file_path)
-        self._emit(progress_callback, phase="completed", video_id=parsed.video_id, progress=100, bytes_written=bytes_written)
-        return DownloadResult(video_id=parsed.video_id, file_path=file_path, source_url=source_url, bytes_written=bytes_written)
+        upload_path = file_path
+        if self.enhance_video:
+            self._emit(progress_callback, phase="enhancing", video_id=parsed.video_id, progress=99)
+            upload_path = self.video_enhancer(file_path)
+        upload_size = upload_path.stat().st_size
+        self._emit(progress_callback, phase="completed", video_id=parsed.video_id, progress=100, bytes_written=upload_size)
+        return DownloadResult(video_id=parsed.video_id, file_path=upload_path, source_url=source_url, bytes_written=upload_size)
 
     async def _download_photo_post(self, parsed, progress_callback: ProgressCallback | None) -> DownloadResult:
         photo_data = parsed.photo_data

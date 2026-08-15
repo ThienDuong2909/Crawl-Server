@@ -1,3 +1,5 @@
+from urllib.parse import parse_qs, urlparse
+
 from fastapi.testclient import TestClient
 
 
@@ -52,7 +54,9 @@ def test_tiktok_oauth_callback_stores_redacted_token(monkeypatch, tmp_path):
 
     monkeypatch.setattr(main.httpx, 'post', fake_post)
     client = TestClient(main.app)
-    resp = client.get('/api/tiktok/oauth/callback?code=code123&state=manual')
+    auth_url = client.get('/api/tiktok/oauth/connect').json()['auth_url']
+    state = parse_qs(urlparse(auth_url).query)['state'][0]
+    resp = client.get(f'/api/tiktok/oauth/callback?code=code123&state={state}')
     assert resp.status_code == 200
     body = resp.json()
     assert body['ok'] is True
@@ -99,7 +103,7 @@ def test_n8n_publish_job_sends_video_url_and_callback_without_leaking_tokens(mon
 
     monkeypatch.setattr(main.httpx, 'post', fake_post)
     client = TestClient(main.app)
-    resp = client.post('/api/upload/n8n/jobs', json={'filename': 'douyin_123.mp4', 'account': 'sandbox', 'caption': 'hello #test'})
+    resp = client.post('/api/upload/n8n/jobs', json={'filename': 'douyin_123.mp4', 'account': 'main_tiktok', 'caption': 'hello #test'})
     assert resp.status_code == 200
     body = resp.json()
     assert body['status'] in {'running', 'success'}
@@ -137,7 +141,7 @@ def test_n8n_business_failure_marks_upload_job_failed_with_debug_error(monkeypat
             return {'ok': False, 'status': 'failed', 'callback_ok': False, 'error': 'Request failed with status code 403'}
 
     monkeypatch.setattr(main.httpx, 'post', lambda *args, **kwargs: FakeResponse())
-    body = TestClient(main.app).post('/api/upload/n8n/jobs', json={'filename': 'douyin_403.mp4', 'account': 'sandbox', 'caption': 'hello'}).json()
+    body = TestClient(main.app).post('/api/upload/n8n/jobs', json={'filename': 'douyin_403.mp4', 'account': 'main_tiktok', 'caption': 'hello'}).json()
 
     assert body['status'] == 'failed'
     assert body['progress'] == 100
@@ -186,7 +190,7 @@ def test_refreshes_expired_tiktok_access_token_before_n8n_publish(monkeypatch, t
 
     monkeypatch.setattr(main.httpx, 'post', fake_post)
     client = TestClient(main.app)
-    resp = client.post('/api/upload/n8n/jobs', json={'filename': 'douyin_456.mp4', 'account': 'sandbox', 'caption': 'hello #test'})
+    resp = client.post('/api/upload/n8n/jobs', json={'filename': 'douyin_456.mp4', 'account': 'main_tiktok', 'caption': 'hello #test'})
     assert resp.status_code == 200
     assert len(calls) == 2
     assert main.load_tiktok_oauth_token()['access_token'] == 'fresh.access'

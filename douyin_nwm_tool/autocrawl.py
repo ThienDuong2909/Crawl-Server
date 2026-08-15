@@ -214,6 +214,7 @@ class AutoCrawlDatabase:
                 # Preserve mandatory translation for existing rows during migration.
                 # add_channel writes an explicit opt-in value for every new row.
                 "translate_enabled": "INTEGER NOT NULL DEFAULT 1",
+                "tiktok_account_id": "TEXT NOT NULL DEFAULT 'main_tiktok'",
                 "is_deleted": "INTEGER NOT NULL DEFAULT 0",
             })
             self._ensure_columns(conn, "videos", {
@@ -282,23 +283,27 @@ class AutoCrawlDatabase:
         schedule_enabled: bool = True,
         auto_upload_enabled: bool = False,
         translate_enabled: bool = False,
+        tiktok_account_id: str = "main_tiktok",
     ) -> dict[str, Any]:
         if "douyin.com" not in profile_url:
             raise ValueError("URL kênh phải là douyin.com")
         interval = max(1, int(interval_minutes))
+        account_id = str(tiktok_account_id or "main_tiktok").strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", account_id):
+            raise ValueError("TikTok account ID không hợp lệ")
         next_run_at = time.time() + interval * 60 if schedule_enabled else None
         with self.connection() as conn:
             archived = conn.execute("SELECT id FROM tracked_channels WHERE profile_url=? AND is_deleted=1", (profile_url.strip(),)).fetchone()
             if archived:
                 next_run_at = time.time() + interval * 60 if schedule_enabled else None
-                conn.execute("""UPDATE tracked_channels SET display_name=?, douyin_uid=?, status='active', interval_minutes=?, schedule_enabled=?, next_run_at=?, auto_upload_enabled=?, translate_enabled=?, is_deleted=0, updated_at=? WHERE id=?""", (display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled), int(translate_enabled), time.time(), archived["id"]))
+                conn.execute("""UPDATE tracked_channels SET display_name=?, douyin_uid=?, status='active', interval_minutes=?, schedule_enabled=?, next_run_at=?, auto_upload_enabled=?, translate_enabled=?, tiktok_account_id=?, is_deleted=0, updated_at=? WHERE id=?""", (display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled), int(translate_enabled), account_id, time.time(), archived["id"]))
                 row = conn.execute("SELECT * FROM tracked_channels WHERE id=?", (archived["id"],)).fetchone()
                 return dict(row) if row else {}
             cur = conn.execute(
                 """INSERT INTO tracked_channels(
-                    profile_url, display_name, douyin_uid, interval_minutes, schedule_enabled, next_run_at, auto_upload_enabled, translate_enabled
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (profile_url.strip(), display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled), int(translate_enabled)),
+                    profile_url, display_name, douyin_uid, interval_minutes, schedule_enabled, next_run_at, auto_upload_enabled, translate_enabled, tiktok_account_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (profile_url.strip(), display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled), int(translate_enabled), account_id),
             )
             row = conn.execute("SELECT * FROM tracked_channels WHERE id=?", (cur.lastrowid,)).fetchone()
             return dict(row) if row else {}
@@ -354,7 +359,7 @@ class AutoCrawlDatabase:
         self.update_channel(channel_id, status="active", error_count=0, error_message=None)
 
     def update_channel(self, channel_id: int, **fields: Any) -> None:
-        allowed = {"status", "last_scraped_at", "last_video_id", "error_count", "error_message", "douyin_uid", "metadata", "interval_minutes", "schedule_enabled", "next_run_at", "last_run_at", "auto_upload_enabled", "translate_enabled", "is_deleted"}
+        allowed = {"status", "last_scraped_at", "last_video_id", "error_count", "error_message", "douyin_uid", "metadata", "interval_minutes", "schedule_enabled", "next_run_at", "last_run_at", "auto_upload_enabled", "translate_enabled", "tiktok_account_id", "is_deleted"}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -795,13 +800,14 @@ class TikTokAutoUploader:
 
     async def upload_translated(self, video: dict[str, Any], translated_title: str) -> dict[str, Any]:
         translated_title = str(translated_title or "").split("#", 1)[0].strip()
+        account_id = str(video.get("tiktok_account_id") or "main_tiktok").strip() or "main_tiktok"
         if str(video.get("media_type") or "video") == "photo":
             photo_id = str(video.get("video_id") or "").strip()
             if not photo_id:
                 raise RuntimeError("Downloaded photo ID is missing")
             payload = {
                 "photo_id": photo_id,
-                "account": "main_tiktok",
+                "account": account_id,
                 "caption": translated_title or "Bài ảnh mới",
             }
             target_endpoint = self.photo_endpoint
@@ -811,7 +817,7 @@ class TikTokAutoUploader:
                 raise RuntimeError("Downloaded video filename is missing")
             payload = {
                 "filename": filename,
-                "account": "main_tiktok",
+                "account": account_id,
                 "caption": translated_title or "Video mới",
                 "options": {"visibility_type": 0, "allow_comment": 1, "allow_duet": 0, "allow_stitch": 0},
             }
@@ -932,6 +938,17 @@ class AutoCrawlManager:
         self.db.update_video_auto_upload(video_id, status="queued", error=None)
         try:
             current_video = self.db.get_video(video_id) or video
+            raw_account = current_video.get("raw_data") or {}
+            if isinstance(raw_account, str):
+                try:
+                    raw_account = json.loads(raw_account)
+                except json.JSONDecodeError:
+                    raw_account = {}
+            current_video["tiktok_account_id"] = str(
+                (raw_account if isinstance(raw_account, dict) else {}).get("tiktok_account_id")
+                or channel.get("tiktok_account_id")
+                or "main_tiktok"
+            )
             translate_title = getattr(self.auto_uploader, "translate_title", None)
             upload_translated = getattr(self.auto_uploader, "upload_translated", None)
             if callable(translate_title) and callable(upload_translated):
@@ -1034,6 +1051,7 @@ class AutoCrawlManager:
                         continue
                     captured_raw_data = dict(candidate.raw_data or {})
                     captured_raw_data["translate_enabled"] = bool(channel.get("translate_enabled"))
+                    captured_raw_data["tiktok_account_id"] = str(channel.get("tiktok_account_id") or "main_tiktok")
                     candidate.raw_data = captured_raw_data
                     self.db.record_video(channel["id"], candidate, status="pending")
                     new_videos += 1

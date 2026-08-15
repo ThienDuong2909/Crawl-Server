@@ -118,7 +118,7 @@ def test_upload_queue_waits_60_to_120_seconds_between_tiktok_jobs(tmp_path, monk
     gate = main.TikTokUploadGate(
         min_interval_seconds=60,
         max_interval_seconds=120,
-        clock=lambda: now[0],
+        clock=lambda account_id="main_tiktok": now[0],
         sleeper=fake_sleep,
         choose_interval=lambda low, high: 75,
     )
@@ -261,7 +261,7 @@ def test_inbox_mode_initializes_and_uploads_video_for_user_review(tmp_path, monk
     main.job_manager.reset()
     main.job_manager.adapter = main.TikTokUploadAdapter()
     monkeypatch.setenv("TIKTOK_UPLOAD_MODE", "inbox")
-    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda: {"access_token": "sandbox-access-token"})
+    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda account_id="main_tiktok": {"access_token": "sandbox-access-token"})
     sent = {"posts": [], "puts": []}
 
     class InitResponse:
@@ -293,7 +293,7 @@ def test_inbox_mode_initializes_and_uploads_video_for_user_review(tmp_path, monk
     monkeypatch.setattr(main.httpx, "post", fake_post)
     monkeypatch.setattr(main.httpx, "put", fake_put)
     body = TestClient(main.app).post("/api/upload/jobs", json={
-        "filename": "douyin_inbox.mp4", "account": "sandbox", "caption": "ignored in inbox",
+        "filename": "douyin_inbox.mp4", "account": "main_tiktok", "caption": "ignored in inbox",
     }).json()
 
     assert body["status"] == "awaiting_user_review"
@@ -330,7 +330,7 @@ def test_inbox_mode_preserves_tiktok_daily_cap_error_without_uploading(tmp_path,
     main.job_manager.reset()
     main.job_manager.adapter = main.TikTokUploadAdapter()
     monkeypatch.setenv("TIKTOK_UPLOAD_MODE", "inbox")
-    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda: {"access_token": "secret-token"})
+    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda account_id="main_tiktok": {"access_token": "secret-token"})
 
     class CappedResponse:
         status_code = 400
@@ -373,9 +373,9 @@ def test_inbox_mode_fails_closed_when_oauth_token_is_unavailable(tmp_path, monke
     main.job_manager.reset()
     main.job_manager.adapter = main.TikTokUploadAdapter()
     monkeypatch.setenv("TIKTOK_UPLOAD_MODE", "inbox")
-    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda: (_ for _ in ()).throw(RuntimeError("TikTok OAuth token unavailable")))
+    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda account_id="main_tiktok": (_ for _ in ()).throw(RuntimeError("TikTok OAuth token unavailable")))
     body = TestClient(main.app).post("/api/upload/jobs", json={
-        "filename": "douyin_inbox.mp4", "account": "sandbox", "caption": "caption",
+        "filename": "douyin_inbox.mp4", "account": "main_tiktok", "caption": "caption",
     }).json()
     assert body["status"] == "failed"
     assert body["result"] is None
@@ -400,7 +400,7 @@ def test_photo_media_upload_sends_ordered_images_to_tiktok_inbox(tmp_path, monke
     monkeypatch.setattr(main.settings, "data_dir", tmp_path / "data")
     monkeypatch.setenv("TIKTOK_UPLOAD_MODE", "inbox")
     monkeypatch.setenv("PUBLIC_BASE_URL", "https://nwm.thienne.io.vn")
-    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda: {"access_token": "photo-access-token"})
+    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda account_id="main_tiktok": {"access_token": "photo-access-token"})
     main.job_manager.reset()
     sent = {}
 
@@ -416,7 +416,7 @@ def test_photo_media_upload_sends_ordered_images_to_tiktok_inbox(tmp_path, monke
 
     monkeypatch.setattr(main.httpx, "post", fake_post)
     client = TestClient(main.app)
-    response = client.post("/api/upload/photo-jobs", json={"photo_id": "photo-68", "account": "sandbox", "caption": "Tiêu đề Việt"})
+    response = client.post("/api/upload/photo-jobs", json={"photo_id": "photo-68", "account": "main_tiktok", "caption": "Tiêu đề Việt"})
 
     assert response.status_code == 200
     body = response.json()
@@ -466,7 +466,7 @@ def test_photo_upload_fails_closed_when_watermark_stage_is_not_clean(tmp_path, m
     monkeypatch.setattr(main.settings, "download_dir", tmp_path)
     monkeypatch.setattr(main.settings, "data_dir", tmp_path / "data")
     monkeypatch.setenv("TIKTOK_UPLOAD_MODE", "inbox")
-    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda: {"access_token": "test-token"})
+    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda account_id="main_tiktok": {"access_token": "test-token"})
     main.job_manager.reset()
     called = {"tiktok": False}
 
@@ -476,7 +476,7 @@ def test_photo_upload_fails_closed_when_watermark_stage_is_not_clean(tmp_path, m
 
     monkeypatch.setattr(main.httpx, "post", forbidden_post)
     body = TestClient(main.app).post("/api/upload/photo-jobs", json={
-        "photo_id": "blocked", "account": "sandbox", "caption": "Tiêu đề Việt",
+        "photo_id": "blocked", "account": "main_tiktok", "caption": "Tiêu đề Việt",
     }).json()
 
     assert body["status"] == "failed"
@@ -487,7 +487,7 @@ def test_photo_upload_fails_closed_when_watermark_stage_is_not_clean(tmp_path, m
 def test_publish_status_endpoint_returns_scrubbed_inbox_state(monkeypatch):
     from tiktok_upload_service import main
 
-    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda: {"access_token": "sandbox-access-token"})
+    monkeypatch.setattr(main, "refresh_tiktok_access_token_if_needed", lambda account_id="main_tiktok": {"access_token": "sandbox-access-token"})
     sent = {}
 
     class FakeResponse:

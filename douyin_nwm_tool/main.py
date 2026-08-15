@@ -129,6 +129,7 @@ class CrawlChannelRequest(BaseModel):
     schedule_enabled: bool = True
     auto_upload_enabled: bool = False
     translate_enabled: bool = False
+    tiktok_account_id: str = "main_tiktok"
 
 
 class CrawlRunRequest(BaseModel):
@@ -142,6 +143,7 @@ class CrawlChannelStatusRequest(BaseModel):
     schedule_enabled: bool | None = None
     auto_upload_enabled: bool | None = None
     translate_enabled: bool | None = None
+    tiktok_account_id: str | None = None
 
 
 class CrawlVideoActionRequest(BaseModel):
@@ -305,6 +307,7 @@ async def crawl_add_channel(payload: CrawlChannelRequest, background_tasks: Back
             schedule_enabled=payload.schedule_enabled,
             auto_upload_enabled=payload.auto_upload_enabled,
             translate_enabled=payload.translate_enabled,
+            tiktok_account_id=payload.tiktok_account_id,
         )
         autocrawl_manager.db.update_channel(channel["id"], schedule_enabled=0, next_run_at=None)
         background_tasks.add_task(
@@ -348,6 +351,11 @@ async def crawl_update_channel(channel_id: int, payload: CrawlChannelStatusReque
         autocrawl_manager.db.update_channel(channel_id, auto_upload_enabled=int(payload.auto_upload_enabled))
     if payload.translate_enabled is not None:
         autocrawl_manager.db.update_channel(channel_id, translate_enabled=int(payload.translate_enabled))
+    if payload.tiktok_account_id is not None:
+        account_id = payload.tiktok_account_id.strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", account_id):
+            raise HTTPException(status_code=400, detail="TikTok account ID không hợp lệ")
+        autocrawl_manager.db.update_channel(channel_id, tiktok_account_id=account_id)
     return autocrawl_manager.db.get_channel(channel_id)
 
 

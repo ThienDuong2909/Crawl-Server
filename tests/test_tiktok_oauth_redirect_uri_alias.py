@@ -1,3 +1,5 @@
+from urllib.parse import parse_qs, urlparse
+
 from fastapi.testclient import TestClient
 
 
@@ -39,7 +41,9 @@ def test_doc_callback_alias_exchanges_code(monkeypatch, tmp_path):
 
     monkeypatch.setattr(main.httpx, 'post', fake_post)
     client = TestClient(main.app)
-    resp = client.get('/api/tiktok/callback?code=code123')
+    auth_url = client.get('/api/tiktok/oauth/connect').json()['auth_url']
+    state = parse_qs(urlparse(auth_url).query)['state'][0]
+    resp = client.get(f'/api/tiktok/callback?code=code123&state={state}')
     assert resp.status_code == 200
     assert resp.json()['ok'] is True
     assert client.get('/api/tiktok/oauth/status').json()['has_access_token'] is True
@@ -60,6 +64,8 @@ def test_doc_callback_alias_does_not_store_tiktok_error_response(monkeypatch, tm
 
     monkeypatch.setattr(main.httpx, 'post', lambda *args, **kwargs: FakeResponse())
     client = TestClient(main.app)
-    resp = client.get('/api/tiktok/callback?code=badcode')
+    auth_url = client.get('/api/tiktok/oauth/connect').json()['auth_url']
+    state = parse_qs(urlparse(auth_url).query)['state'][0]
+    resp = client.get(f'/api/tiktok/callback?code=badcode&state={state}')
     assert resp.status_code == 400
     assert client.get('/api/tiktok/oauth/status').json()['has_access_token'] is False

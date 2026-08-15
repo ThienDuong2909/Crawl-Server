@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import random
+import re
 import secrets
 import threading
 import time
@@ -13,6 +16,7 @@ from typing import Any, Literal
 from urllib.parse import urlencode
 
 import httpx
+from Cryptodome.Cipher import AES
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field
@@ -78,8 +82,196 @@ def load_tiktok_oauth_config() -> dict[str, str]:
     return {"client_key": client_key.strip(), "client_secret": client_secret.strip()}
 
 
-def tiktok_oauth_token_path() -> Path:
-    return settings.data_dir / "tiktok_oauth_token.json"
+DEFAULT_TIKTOK_ACCOUNT_ID = "main_tiktok"
+_oauth_state_lock = threading.Lock()
+
+
+def tiktok_oauth_token_path(account_id: str = DEFAULT_TIKTOK_ACCOUNT_ID) -> Path:
+    safe_id = validate_account_id(account_id)
+    if safe_id == DEFAULT_TIKTOK_ACCOUNT_ID:
+        # Preserve the production token path for backwards compatibility.
+        return settings.data_dir / "tiktok_oauth_token.json"
+    return settings.data_dir / "tiktok_accounts" / f"{safe_id}.token.json"
+
+
+def tiktok_accounts_registry_path() -> Path:
+    return settings.data_dir / "tiktok_accounts.json"
+
+
+def tiktok_oauth_states_path() -> Path:
+    return settings.data_dir / "tiktok_oauth_states.json"
+
+
+def validate_account_id(account_id: str) -> str:
+    value = str(account_id or DEFAULT_TIKTOK_ACCOUNT_ID).strip()
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", value):
+        raise HTTPException(status_code=400, detail="Invalid TikTok account ID")
+    return value
+
+
+def _decode_token_key(value: str, name: str) -> bytes:
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except Exception as exc:
+        raise RuntimeError(f"{name} must be URL-safe base64") from exc
+    if len(raw) != 32:
+        raise RuntimeError(f"{name} must decode to 32 bytes")
+    return raw
+
+
+def _token_encryption_key() -> bytes:
+    env_value = os.getenv("TIKTOK_TOKEN_ENCRYPTION_KEY", "").strip()
+    if env_value:
+        return _decode_token_key(env_value, "TIKTOK_TOKEN_ENCRYPTION_KEY")
+    key_path = settings.data_dir / ".tiktok_token_encryption.key"
+    try:
+        if key_path.exists():
+            raw = base64.urlsafe_b64decode(key_path.read_text(encoding="utf-8").strip())
+            if len(raw) != 32:
+                raise RuntimeError("TikTok token encryption key has invalid length")
+            return raw
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        raw = secrets.token_bytes(32)
+        key_path.write_text(base64.urlsafe_b64encode(raw).decode("ascii"), encoding="utf-8")
+        key_path.chmod(0o600)
+        return raw
+    except OSError as exc:
+        raise RuntimeError("Cannot access TikTok token encryption key; refusing plaintext token storage") from exc
+
+
+def _token_decryption_keys() -> list[bytes]:
+    keys = [_token_encryption_key()]
+    previous = os.getenv("TIKTOK_TOKEN_ENCRYPTION_PREVIOUS_KEYS", "").strip()
+    for index, value in enumerate(part.strip() for part in previous.split(",") if part.strip()):
+        candidate = _decode_token_key(value, f"TIKTOK_TOKEN_ENCRYPTION_PREVIOUS_KEYS[{index}]")
+        if candidate not in keys:
+            keys.append(candidate)
+    return keys
+
+
+def _write_encrypted_json(path: Path, payload: dict[str, Any]) -> None:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    nonce = secrets.token_bytes(12)
+    cipher = AES.new(_token_encryption_key(), AES.MODE_GCM, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(raw)
+    envelope = {
+        "version": 1,
+        "algorithm": "AES-256-GCM",
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        "tag": base64.b64encode(tag).decode("ascii"),
+    }
+    _write_secret_json(path, envelope)
+
+
+def _read_encrypted_json(path: Path) -> dict[str, Any]:
+    envelope = _read_json_file(path)
+    if not envelope:
+        return {}
+    if envelope.get("version") != 1:
+        # One-time migration of the existing single-account plaintext token.
+        _write_encrypted_json(path, envelope)
+        return envelope
+    failures: list[Exception] = []
+    for index, key in enumerate(_token_decryption_keys()):
+        try:
+            cipher = AES.new(key, AES.MODE_GCM, nonce=base64.b64decode(envelope["nonce"]))
+            raw = cipher.decrypt_and_verify(base64.b64decode(envelope["ciphertext"]), base64.b64decode(envelope["tag"]))
+            decoded = json.loads(raw.decode("utf-8"))
+            if not isinstance(decoded, dict):
+                return {}
+            if index > 0:
+                _write_encrypted_json(path, decoded)
+            return decoded
+        except Exception as exc:
+            failures.append(exc)
+    raise RuntimeError("TikTok OAuth token could not be decrypted with current or previous keys; refusing to continue") from failures[-1]
+
+
+def _default_account_record() -> dict[str, Any]:
+    return {
+        "id": DEFAULT_TIKTOK_ACCOUNT_ID,
+        "display_name": "TikTok hiện tại",
+        "is_default": True,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
+def load_tiktok_accounts_registry() -> dict[str, Any]:
+    payload = _read_json_file(tiktok_accounts_registry_path())
+    items = payload.get("items") if isinstance(payload.get("items"), list) else []
+    by_id = {str(item.get("id")): dict(item) for item in items if isinstance(item, dict) and item.get("id")}
+    current = by_id.get(DEFAULT_TIKTOK_ACCOUNT_ID, {})
+    by_id[DEFAULT_TIKTOK_ACCOUNT_ID] = {**_default_account_record(), **current, "id": DEFAULT_TIKTOK_ACCOUNT_ID, "is_default": True}
+    return {"default_account_id": DEFAULT_TIKTOK_ACCOUNT_ID, "items": list(by_id.values())}
+
+
+def save_tiktok_accounts_registry(payload: dict[str, Any]) -> None:
+    _write_secret_json(tiktok_accounts_registry_path(), payload)
+
+
+def create_tiktok_account(display_name: str) -> dict[str, Any]:
+    label = str(display_name or "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="TikTok account display name is required")
+    registry = load_tiktok_accounts_registry()
+    base = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "tiktok"
+    account_id = f"{base[:48]}-{secrets.token_hex(3)}"
+    now = time.time()
+    item = {"id": account_id, "display_name": label[:128], "is_default": False, "created_at": now, "updated_at": now}
+    registry["items"].append(item)
+    save_tiktok_accounts_registry(registry)
+    return account_public_status(item)
+
+
+def account_registry_item(account_id: str) -> dict[str, Any]:
+    safe_id = validate_account_id(account_id)
+    for item in load_tiktok_accounts_registry()["items"]:
+        if item.get("id") == safe_id:
+            return item
+    raise HTTPException(status_code=404, detail="TikTok account not found")
+
+
+def account_public_status(item: dict[str, Any]) -> dict[str, Any]:
+    account_id = str(item["id"])
+    token = load_tiktok_oauth_token(account_id)
+    return {
+        "id": account_id,
+        "display_name": str(item.get("display_name") or account_id),
+        "is_default": account_id == DEFAULT_TIKTOK_ACCOUNT_ID,
+        "has_access_token": bool(token.get("access_token")),
+        "open_id": str(token.get("open_id") or ""),
+        "scope": str(token.get("scope") or ""),
+        "expires_at": token.get("access_token_expires_at"),
+        "refresh_expires_at": token.get("refresh_token_expires_at"),
+        "updated_at": token.get("updated_at") or item.get("updated_at"),
+    }
+
+
+def list_tiktok_accounts() -> dict[str, Any]:
+    registry = load_tiktok_accounts_registry()
+    return {"default_account_id": DEFAULT_TIKTOK_ACCOUNT_ID, "items": [account_public_status(item) for item in registry["items"]]}
+
+
+def delete_tiktok_account(account_id: str) -> None:
+    safe_id = validate_account_id(account_id)
+    if safe_id == DEFAULT_TIKTOK_ACCOUNT_ID:
+        raise HTTPException(status_code=400, detail="Default TikTok account cannot be deleted")
+    registry = load_tiktok_accounts_registry()
+    original = len(registry["items"])
+    registry["items"] = [item for item in registry["items"] if item.get("id") != safe_id]
+    if len(registry["items"]) == original:
+        raise HTTPException(status_code=404, detail="TikTok account not found")
+    save_tiktok_accounts_registry(registry)
+    try:
+        tiktok_oauth_token_path(safe_id).unlink(missing_ok=True)
+        with _oauth_state_lock:
+            states = _read_encrypted_json(tiktok_oauth_states_path())
+            states = {key: value for key, value in states.items() if str((value or {}).get("account_id")) != safe_id}
+            _write_encrypted_json(tiktok_oauth_states_path(), states)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail="Could not remove TikTok account token") from exc
 
 
 def redact_token(value: str) -> str:
@@ -90,7 +282,10 @@ def redact_token(value: str) -> str:
     return f"{value[:4]}...{value[-4:]}"
 
 
-def save_tiktok_oauth_token(payload: dict[str, Any]) -> dict[str, Any]:
+def save_tiktok_oauth_token(payload: dict[str, Any], account_id: str = DEFAULT_TIKTOK_ACCOUNT_ID) -> dict[str, Any]:
+    safe_id = validate_account_id(account_id)
+    if safe_id != DEFAULT_TIKTOK_ACCOUNT_ID:
+        account_registry_item(safe_id)
     now = time.time()
     token_payload = dict(payload)
     token_payload["updated_at"] = now
@@ -98,18 +293,20 @@ def save_tiktok_oauth_token(payload: dict[str, Any]) -> dict[str, Any]:
         token_payload["access_token_expires_at"] = now + int(token_payload.get("expires_in") or 0)
     if "refresh_expires_in" in token_payload and "refresh_token_expires_at" not in token_payload:
         token_payload["refresh_token_expires_at"] = now + int(token_payload.get("refresh_expires_in") or 0)
-    _write_secret_json(tiktok_oauth_token_path(), token_payload)
-    return load_tiktok_oauth_status()
+    _write_encrypted_json(tiktok_oauth_token_path(safe_id), token_payload)
+    return load_tiktok_oauth_status(safe_id)
 
 
-def load_tiktok_oauth_token() -> dict[str, Any]:
-    return _read_json_file(tiktok_oauth_token_path())
+def load_tiktok_oauth_token(account_id: str = DEFAULT_TIKTOK_ACCOUNT_ID) -> dict[str, Any]:
+    return _read_encrypted_json(tiktok_oauth_token_path(account_id))
 
 
-def load_tiktok_oauth_status() -> dict[str, Any]:
+def load_tiktok_oauth_status(account_id: str = DEFAULT_TIKTOK_ACCOUNT_ID) -> dict[str, Any]:
+    safe_id = validate_account_id(account_id)
     config = load_tiktok_oauth_config()
-    token = load_tiktok_oauth_token()
+    token = load_tiktok_oauth_token(safe_id)
     return {
+        "account_id": safe_id,
         "has_client_config": bool(config["client_key"] and config["client_secret"]),
         "has_access_token": bool(token.get("access_token")),
         "open_id": token.get("open_id", ""),
@@ -120,6 +317,12 @@ def load_tiktok_oauth_status() -> dict[str, Any]:
         "redirect_uri": settings.tiktok_redirect_uri,
         "n8n_webhook_configured": bool(settings.n8n_webhook_url),
     }
+
+
+class TikTokOAuthAccountCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str = Field(min_length=1, max_length=128)
 
 
 class TikTokAccountUpdate(BaseModel):
@@ -270,7 +473,7 @@ class TikTokUploadAdapter:
                 "note": "Dry-run only: no request was sent to TikTok. Switch TIKTOK_UPLOAD_MODE after configuring a real uploader adapter.",
             }
         if mode == "inbox":
-            token = refresh_tiktok_access_token_if_needed()
+            token = refresh_tiktok_access_token_if_needed(account)
             access_token = str(token.get("access_token") or "")
             if not access_token:
                 raise RuntimeError("TikTok OAuth token unavailable; connect TikTok first")
@@ -600,7 +803,34 @@ def callback_url() -> str:
     return f"{settings.public_base_url}/api/tiktok/update-status"
 
 
-def build_tiktok_authorization_url() -> str:
+def _create_oauth_state(account_id: str) -> str:
+    safe_id = validate_account_id(account_id)
+    account_registry_item(safe_id)
+    state = secrets.token_urlsafe(32)
+    now = time.time()
+    with _oauth_state_lock:
+        states = _read_encrypted_json(tiktok_oauth_states_path())
+        states = {key: value for key, value in states.items() if float((value or {}).get("expires_at") or 0) > now}
+        states[state] = {"account_id": safe_id, "expires_at": now + 600}
+        _write_encrypted_json(tiktok_oauth_states_path(), states)
+    return state
+
+
+def _consume_oauth_state(state: str) -> str:
+    if not state:
+        raise HTTPException(status_code=400, detail="TikTok OAuth state is missing or expired")
+    now = time.time()
+    with _oauth_state_lock:
+        states = _read_encrypted_json(tiktok_oauth_states_path())
+        item = states.pop(state, None)
+        states = {key: value for key, value in states.items() if float((value or {}).get("expires_at") or 0) > now}
+        _write_encrypted_json(tiktok_oauth_states_path(), states)
+    if not item or float(item.get("expires_at") or 0) <= now:
+        raise HTTPException(status_code=400, detail="TikTok OAuth state is invalid, expired, or already used")
+    return validate_account_id(str(item.get("account_id") or ""))
+
+
+def build_tiktok_authorization_url(account_id: str = DEFAULT_TIKTOK_ACCOUNT_ID) -> str:
     config = load_tiktok_oauth_config()
     if not config["client_key"] or not config["client_secret"]:
         raise HTTPException(status_code=400, detail="TikTok OAuth client config is missing")
@@ -609,7 +839,7 @@ def build_tiktok_authorization_url() -> str:
         "scope": "user.info.basic,video.upload,video.publish,video.list",
         "response_type": "code",
         "redirect_uri": settings.tiktok_redirect_uri,
-        "state": secrets.token_urlsafe(16),
+        "state": _create_oauth_state(account_id),
     }
     return "https://www.tiktok.com/v2/auth/authorize/?" + urlencode(params)
 
@@ -634,8 +864,9 @@ def exchange_tiktok_code(code: str) -> dict[str, Any]:
     return response.json()
 
 
-def refresh_tiktok_access_token_if_needed() -> dict[str, Any]:
-    token = load_tiktok_oauth_token()
+def refresh_tiktok_access_token_if_needed(account_id: str = DEFAULT_TIKTOK_ACCOUNT_ID) -> dict[str, Any]:
+    safe_id = validate_account_id(account_id)
+    token = load_tiktok_oauth_token(safe_id)
     access_token = str(token.get("access_token") or "")
     expires_at = float(token.get("access_token_expires_at") or 0)
     if access_token and expires_at and expires_at > time.time() + 300:
@@ -659,12 +890,12 @@ def refresh_tiktok_access_token_if_needed() -> dict[str, Any]:
     )
     response.raise_for_status()
     refreshed = {**token, **response.json()}
-    save_tiktok_oauth_token(refreshed)
-    return load_tiktok_oauth_token()
+    save_tiktok_oauth_token(refreshed, safe_id)
+    return load_tiktok_oauth_token(safe_id)
 
 
-def fetch_tiktok_publish_status(publish_id: str) -> dict[str, Any]:
-    token = refresh_tiktok_access_token_if_needed()
+def fetch_tiktok_publish_status(publish_id: str, account_id: str = DEFAULT_TIKTOK_ACCOUNT_ID) -> dict[str, Any]:
+    token = refresh_tiktok_access_token_if_needed(account_id)
     access_token = str(token.get("access_token") or "")
     if not access_token:
         raise HTTPException(status_code=400, detail="TikTok OAuth access token is missing; connect TikTok first")
@@ -720,7 +951,7 @@ def create_photo_upload_job(payload: PhotoUploadJobRequest) -> UploadJob:
                 "photo_id": payload.photo_id,
             }
         elif mode == "inbox":
-            token = refresh_tiktok_access_token_if_needed()
+            token = refresh_tiktok_access_token_if_needed(payload.account)
             access_token = str(token.get("access_token") or "")
             if not access_token:
                 raise RuntimeError("TikTok OAuth token unavailable; connect TikTok first")
@@ -779,7 +1010,7 @@ def create_photo_upload_job(payload: PhotoUploadJobRequest) -> UploadJob:
 
 def create_n8n_publish_job(payload: UploadJobRequest) -> UploadJob:
     video_path = resolve_video_path(payload.filename)
-    token = refresh_tiktok_access_token_if_needed()
+    token = refresh_tiktok_access_token_if_needed(payload.account)
     access_token = str(token.get("access_token") or "")
     if not access_token:
         raise HTTPException(status_code=400, detail="TikTok OAuth access token is missing; connect TikTok first")
@@ -884,23 +1115,47 @@ async def tiktok_oauth_status():
 
 
 @app.get("/api/tiktok/publish/status/{publish_id}")
-async def tiktok_publish_status(publish_id: str):
-    return fetch_tiktok_publish_status(publish_id)
+async def tiktok_publish_status(publish_id: str, account_id: str = DEFAULT_TIKTOK_ACCOUNT_ID):
+    return fetch_tiktok_publish_status(publish_id, account_id)
+
+
+@app.get("/api/tiktok/accounts")
+async def tiktok_accounts():
+    return list_tiktok_accounts()
+
+
+@app.post("/api/tiktok/accounts")
+async def tiktok_create_account(payload: TikTokOAuthAccountCreate):
+    return create_tiktok_account(payload.display_name)
+
+
+@app.delete("/api/tiktok/accounts/{account_id}")
+async def tiktok_delete_account(account_id: str):
+    delete_tiktok_account(account_id)
+    return {"deleted": True, "account_id": account_id}
+
+
+@app.get("/api/tiktok/accounts/{account_id}/oauth/connect")
+async def tiktok_account_oauth_connect(account_id: str):
+    return {"auth_url": build_tiktok_authorization_url(account_id), "redirect_uri": settings.tiktok_redirect_uri}
 
 
 @app.get("/api/tiktok/oauth/connect")
 async def tiktok_oauth_connect():
-    return {"auth_url": build_tiktok_authorization_url(), "redirect_uri": settings.tiktok_redirect_uri}
+    return {"auth_url": build_tiktok_authorization_url(DEFAULT_TIKTOK_ACCOUNT_ID), "redirect_uri": settings.tiktok_redirect_uri}
 
 
 @app.get("/api/tiktok/oauth/callback")
 async def tiktok_oauth_callback(code: str, state: str = ""):
+    account_id = _consume_oauth_state(state)
+    account_registry_item(account_id)
     token = exchange_tiktok_code(code)
     if not token.get("access_token"):
         detail = token.get("error_description") or token.get("error") or "TikTok OAuth did not return access_token"
         raise HTTPException(status_code=400, detail=detail)
-    status = save_tiktok_oauth_token(token)
-    return {"ok": True, "message": "TikTok OAuth connected", "status": status}
+    save_tiktok_oauth_token(token, account_id)
+    account = account_public_status(account_registry_item(account_id))
+    return {"ok": True, "message": "TikTok OAuth connected", "account": account, "status": load_tiktok_oauth_status(account_id)}
 
 
 @app.get("/api/tiktok/callback")

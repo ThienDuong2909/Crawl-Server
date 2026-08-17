@@ -1,6 +1,19 @@
 import asyncio
 import time
+from datetime import datetime, time as clock_time, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
+
+
+def test_backfill_uses_fixed_vietnam_slots_8_11_19():
+    from douyin_nwm_tool.autocrawl import next_backfill_slot_at
+
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    day = datetime(2026, 8, 17, tzinfo=tz)
+    assert next_backfill_slot_at(day.replace(hour=7, minute=59).timestamp()) == day.replace(hour=8, minute=0).timestamp()
+    assert next_backfill_slot_at(day.replace(hour=8, minute=1).timestamp()) == day.replace(hour=11, minute=0).timestamp()
+    assert next_backfill_slot_at(day.replace(hour=11, minute=1).timestamp()) == day.replace(hour=19, minute=0).timestamp()
+    assert next_backfill_slot_at(day.replace(hour=19, minute=1).timestamp()) == (day + timedelta(days=1)).replace(hour=8, minute=0).timestamp()
 
 
 def test_scheduler_runs_backfill_instead_of_normal_crawl_until_completed(tmp_path):
@@ -93,33 +106,35 @@ def test_backfill_processes_only_three_oldest_per_day_then_enables_recurring_sch
         config=AutoCrawlConfig(max_video_age_hours=72),
     )
 
+    db.update_channel(channel["id"], backfill_next_run_at=now - 1)
     first = asyncio.run(manager.run_backfill_batch(channel["id"], now=now))
     after_first = db.get_channel(channel["id"])
-    assert first["processed"] == 3
-    assert uploader.uploaded == ["5", "4", "3"]
+    assert first["processed"] == 1
+    assert uploader.uploaded == ["5"]
     assert after_first["backfill_status"] == "active"
-    assert after_first["backfill_processed"] == 3
+    assert after_first["backfill_processed"] == 1
     assert after_first["schedule_enabled"] == 0
     assert after_first["next_run_at"] is None
-    assert after_first["backfill_next_run_at"] >= now + 24 * 3600
-    assert reporter.events == [(channel["id"], "backfill_progress", 3, 2)]
+    assert after_first["backfill_next_run_at"] > now
+    assert reporter.events == [(channel["id"], "backfill_progress", 1, 4)]
 
     deferred = asyncio.run(manager.run_backfill_batch(channel["id"], now=now + 60))
     assert deferred["status"] == "deferred"
     assert deferred["processed"] == 0
-    assert uploader.uploaded == ["5", "4", "3"]
+    assert uploader.uploaded == ["5"]
 
-    second = asyncio.run(manager.run_backfill_batch(channel["id"], now=now + 24 * 3600 + 1))
+    for index, video_id in enumerate(["4", "3", "2", "1"], start=1):
+        db.update_channel(channel["id"], backfill_next_run_at=now - 1)
+        result = asyncio.run(manager.run_backfill_batch(channel["id"], now=now + index))
+        assert result["processed"] == 1
+        assert uploader.uploaded[-1] == video_id
     completed = db.get_channel(channel["id"])
-    assert second["processed"] == 2
-    assert uploader.uploaded == ["5", "4", "3", "2", "1"]
     assert completed["backfill_status"] == "completed"
     assert completed["backfill_processed"] == 5
     assert completed["backfill_completed_at"] is not None
     assert completed["backfill_next_run_at"] is None
     assert completed["schedule_enabled"] == 1
-    assert completed["next_run_at"] >= now + 24 * 3600
-    assert reporter.events[-1] == (channel["id"], "backfill_completed", 2, 0)
+    assert reporter.events[-1] == (channel["id"], "backfill_completed", 1, 0)
     assert completed["last_notification_status"] == "sent"
 
 

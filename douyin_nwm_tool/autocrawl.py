@@ -12,7 +12,8 @@ import uuid
 import httpx
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,19 @@ from typing import Any
 from .cookie_manager import CookieManager
 from .downloader import DownloadService
 from .translation import AgentRouterTitleTranslator
+
+
+BACKFILL_TIMEZONE = ZoneInfo("Asia/Ho_Chi_Minh")
+BACKFILL_SLOTS = ((8, 0), (11, 0), (19, 0))
+
+
+def next_backfill_slot_at(timestamp: float) -> float:
+    local = datetime.fromtimestamp(float(timestamp), BACKFILL_TIMEZONE)
+    for hour, minute in BACKFILL_SLOTS:
+        slot = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if slot.timestamp() > float(timestamp):
+            return slot.timestamp()
+    return (local + timedelta(days=1)).replace(hour=8, minute=0, second=0, microsecond=0).timestamp()
 
 
 @dataclass
@@ -324,7 +338,7 @@ class AutoCrawlDatabase:
         now = time.time()
         backfill_status = "pending" if needs_backfill else "not_required"
         backfill_cutoff_at = now - 90 * 24 * 3600 if needs_backfill else None
-        backfill_next_run_at = now if needs_backfill else None
+        backfill_next_run_at = next_backfill_slot_at(now) if needs_backfill else None
         effective_schedule = requested_schedule and not needs_backfill
         next_run_at = now + interval * 60 if effective_schedule else None
         with self.connection() as conn:
@@ -1365,7 +1379,7 @@ class AutoCrawlManager:
             raw_data=raw_data if isinstance(raw_data, dict) else {},
         )
 
-    async def run_backfill_batch(self, channel_id: int, *, now: float | None = None, daily_limit: int = 3) -> dict[str, Any]:
+    async def run_backfill_batch(self, channel_id: int, *, now: float | None = None, daily_limit: int = 1) -> dict[str, Any]:
         token = uuid.uuid4().hex
         current = time.time() if now is None else float(now)
         lock = self._backfill_locks.setdefault(channel_id, asyncio.Lock())
@@ -1377,16 +1391,16 @@ class AutoCrawlManager:
             except Exception as exc:
                 channel = self.db.get_channel(channel_id) or {}
                 error = str(exc)
-                self.db.update_channel(channel_id, backfill_status="error", backfill_next_run_at=current + 3600, backfill_error=error, schedule_enabled=0, next_run_at=None)
+                self.db.update_channel(channel_id, backfill_status="error", backfill_next_run_at=next_backfill_slot_at(current), backfill_error=error, schedule_enabled=0, next_run_at=None)
                 remaining = self.db.count_pending_backfill_videos(channel_id)
                 notification = await self._report_progress(channel_id, {"kind": "backfill_error", "processed": 0, "remaining": remaining, "total": int(channel.get("backfill_total") or 0), "error": error})
                 return {"status": "error", "processed": 0, "remaining": remaining, "error": error, "notification": notification}
             finally:
                 self.db.release_backfill_channel(channel_id, token)
 
-    async def _run_backfill_batch_unlocked(self, channel_id: int, *, now: float | None = None, daily_limit: int = 3) -> dict[str, Any]:
+    async def _run_backfill_batch_unlocked(self, channel_id: int, *, now: float | None = None, daily_limit: int = 1) -> dict[str, Any]:
         current = time.time() if now is None else float(now)
-        limit = min(3, max(1, int(daily_limit)))
+        limit = min(1, max(1, int(daily_limit)))
         channel = self.db.get_channel(channel_id)
         if not channel or channel.get("is_deleted"):
             raise ValueError("Channel not found")
@@ -1491,7 +1505,7 @@ class AutoCrawlManager:
             self.db.update_channel(
                 channel_id,
                 backfill_status="error" if error else "active",
-                backfill_next_run_at=current + 24 * 3600,
+                backfill_next_run_at=next_backfill_slot_at(current),
                 backfill_processed=completed_count,
                 backfill_error=error,
                 schedule_enabled=0,

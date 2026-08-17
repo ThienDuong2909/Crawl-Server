@@ -1784,28 +1784,36 @@ class AutoCrawlScheduler:
             (float(row.get("backfill_next_run_at") or 0), "backfill", row)
             for row in self.manager.db.list_due_backfill_channels()
         ]
-        due = sorted(normal + backfill, key=lambda item: (item[0], item[2]["id"]))[:1]
+        due = sorted(normal + backfill, key=lambda item: (item[0], item[2]["id"]))
         completed = failed = 0
         results = []
-        for _, mode, channel in due:
+
+        async def process_one(mode: str, channel: dict[str, Any]) -> tuple[str, dict[str, Any] | None, str | None]:
             try:
                 if mode == "backfill":
                     result = await self.manager.run_backfill_batch(channel["id"])
                 else:
                     result = await self.manager.run_once(channel_id=channel["id"], download=True)
                     self.manager.db.mark_channel_scheduled_run(channel["id"])
-                results.append(result)
-                if (mode == "normal" and result.get("status") != "completed") or (
-                    mode == "backfill" and result.get("status") == "error"
-                ):
-                    failed += 1
-                else:
-                    completed += 1
+                return mode, result, None
             except Exception as exc:
-                failed += 1
-                self.last_error = str(exc)
                 if mode == "normal":
                     self.manager.db.mark_channel_scheduled_run(channel["id"])
+                return mode, None, str(exc)
+
+        outcomes = await asyncio.gather(*(process_one(mode, channel) for _, mode, channel in due))
+        for mode, result, error in outcomes:
+            if error is not None or result is None:
+                failed += 1
+                self.last_error = error or "scheduler worker returned no result"
+                continue
+            results.append(result)
+            if (mode == "normal" and result.get("status") != "completed") or (
+                mode == "backfill" and result.get("status") == "error"
+            ):
+                failed += 1
+            else:
+                completed += 1
         if due:
             self.last_run_at = time.time()
             self.last_result = {"processed": len(due), "completed": completed, "failed": failed, "results": results}

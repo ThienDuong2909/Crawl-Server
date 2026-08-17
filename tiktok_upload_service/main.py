@@ -705,12 +705,28 @@ class UploadJobManager:
         # complete external upload and enforces a cooldown before the next init.
         self.upload_gate = upload_gate or TikTokUploadGate()
         self._upload_lock = self.upload_gate.lock
+        self._account_gate_registry_lock = threading.Lock()
+        self._account_gates: dict[str, TikTokUploadGate] = {}
 
     def reset(self):
         self.jobs.clear()
         self.upload_gate.last_finished_at = None
         self.upload_gate.next_ticket = 0
         self.upload_gate.serving_ticket = 0
+        with self._account_gate_registry_lock:
+            self._account_gates.clear()
+
+    def _gate_for_account(self, account: str) -> TikTokUploadGate:
+        account_id = str(account or "main_tiktok").strip() or "main_tiktok"
+        with self._account_gate_registry_lock:
+            gate = self._account_gates.get(account_id)
+            if gate is not None:
+                return gate
+            # Preserve the injectable legacy gate for the first account, then
+            # allocate independent FIFO/cooldown gates for other accounts.
+            gate = self.upload_gate if not self._account_gates else TikTokUploadGate()
+            self._account_gates[account_id] = gate
+            return gate
 
     @staticmethod
     def _cooldown_enabled() -> bool:
@@ -763,7 +779,7 @@ class UploadJobManager:
             def execute_upload():
                 self._update(job, status="running", progress=20, message="Preparing video for TikTok upload")
                 return self.adapter.upload(video_path=video_path, account=job.account, caption=job.caption, options=job.options)
-            result = self.upload_gate.run(execute_upload, enforce_cooldown=self._cooldown_enabled())
+            result = self._gate_for_account(job.account).run(execute_upload, enforce_cooldown=self._cooldown_enabled())
             workflow_status = str(result.get("workflow_status") or "success")
             message = str(result.get("message") or "Completed")
             self._update(job, status=workflow_status, progress=100, message=message, result=result)

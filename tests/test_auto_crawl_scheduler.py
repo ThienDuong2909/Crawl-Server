@@ -18,6 +18,7 @@ def test_per_channel_scheduler_runs_only_due_jobs_and_reschedules(tmp_path):
 
         async def run_once(self, channel_id=None, download=True):
             self.calls.append(channel_id)
+            await asyncio.sleep(0.02)
             return {"status": "completed", "channel_id": channel_id}
 
     manager = FakeManager()
@@ -31,7 +32,7 @@ def test_per_channel_scheduler_runs_only_due_jobs_and_reschedules(tmp_path):
     assert db.get_channel(disabled["id"])["last_run_at"] is None
 
 
-def test_scheduler_processes_only_one_overdue_channel_per_tick(tmp_path):
+def test_scheduler_processes_all_overdue_channels_in_parallel(tmp_path):
     from douyin_nwm_tool.autocrawl import AutoCrawlDatabase, AutoCrawlScheduler
 
     db = AutoCrawlDatabase(tmp_path / "paced-overdue.db")
@@ -48,6 +49,7 @@ def test_scheduler_processes_only_one_overdue_channel_per_tick(tmp_path):
 
         async def run_once(self, channel_id=None, download=True):
             self.calls.append(channel_id)
+            await asyncio.sleep(0.02)
             return {"status": "completed", "channel_id": channel_id}
 
     manager = FakeManager()
@@ -55,9 +57,10 @@ def test_scheduler_processes_only_one_overdue_channel_per_tick(tmp_path):
 
     result = asyncio.run(scheduler.run_due_channels())
 
-    assert result == {"processed": 1, "completed": 1, "failed": 0}
-    assert manager.calls == [first["id"]]
-    assert db.get_channel(second["id"])["last_run_at"] is None
+    assert result == {"processed": 2, "completed": 2, "failed": 0}
+    assert set(manager.calls) == {first["id"], second["id"]}
+    assert db.get_channel(first["id"])["last_run_at"] is not None
+    assert db.get_channel(second["id"])["last_run_at"] is not None
 
 
 def test_scheduler_retries_due_error_channel_but_never_runs_paused_channel(tmp_path):

@@ -175,9 +175,46 @@ def test_upload_jobs_are_processed_one_at_a_time(tmp_path, monkeypatch):
     assert adapter.max_active == 1
 
 
-def test_ayrshare_mode_auto_publishes_public_video_without_exposing_api_key(tmp_path, monkeypatch):
+def test_different_accounts_can_upload_in_parallel(tmp_path, monkeypatch):
     from tiktok_upload_service import main
 
+    video_dir = tmp_path / "douyin_video"
+    video_dir.mkdir(parents=True)
+    for name in ("douyin_one.mp4", "douyin_two.mp4"):
+        (video_dir / name).write_bytes(b"video")
+    monkeypatch.setattr(main.settings, "download_dir", tmp_path)
+    monkeypatch.setattr(main.settings, "data_dir", tmp_path / "data")
+    monkeypatch.setenv("TIKTOK_UPLOAD_MODE", "dry_run")
+
+    class ParallelAdapter:
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def upload(self, *, video_path, account, caption, options):
+            with self.lock:
+                type(self).active += 1
+                type(self).max_active = max(type(self).max_active, type(self).active)
+            time.sleep(0.05)
+            with self.lock:
+                type(self).active -= 1
+            return {"mode": "test", "ok": True}
+
+    adapter = ParallelAdapter()
+    manager = main.UploadJobManager(adapter=adapter)
+
+    def create(item):
+        filename, account = item
+        return manager.create_and_run(main.UploadJobRequest(filename=filename, account=account, caption="c"))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        jobs = list(pool.map(create, [("douyin_one.mp4", "account_a"), ("douyin_two.mp4", "account_b")]))
+    assert all(job.status == "success" for job in jobs)
+    assert adapter.max_active == 2
+
+
+def test_ayrshare_mode_auto_publishes_public_video_without_exposing_api_key(tmp_path, monkeypatch):
+    from tiktok_upload_service import main
     video_dir = tmp_path / "douyin_video"
     video_dir.mkdir()
     (video_dir / "douyin_public.mp4").write_bytes(b"video-data")

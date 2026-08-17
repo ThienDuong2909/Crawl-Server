@@ -1205,10 +1205,11 @@ async def health():
         "mode": mode,
         "provider_ready": provider_ready,
         "queue": {
-            "serial": True,
+            "serial_per_account": True,
+            "parallel_accounts": True,
             "min_interval_seconds": job_manager.upload_gate.min_interval_seconds,
             "max_interval_seconds": job_manager.upload_gate.max_interval_seconds,
-            "waiting": max(0, job_manager.upload_gate.next_ticket - job_manager.upload_gate.serving_ticket),
+            "waiting": sum(max(0, gate.next_ticket - gate.serving_ticket) for gate in job_manager._account_gates.values()),
         },
     }
 

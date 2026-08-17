@@ -4,12 +4,16 @@ import json
 import math
 import os
 import re
+import smtplib
 import sqlite3
+import ssl
 import time
+import uuid
 import httpx
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
 
@@ -215,8 +219,29 @@ class AutoCrawlDatabase:
                 # add_channel writes an explicit opt-in value for every new row.
                 "translate_enabled": "INTEGER NOT NULL DEFAULT 1",
                 "tiktok_account_id": "TEXT NOT NULL DEFAULT 'main_tiktok'",
+                "recurring_schedule_enabled": "INTEGER NOT NULL DEFAULT 1",
+                "backfill_status": "TEXT NOT NULL DEFAULT 'not_required'",
+                "backfill_cutoff_at": "REAL",
+                "backfill_next_run_at": "REAL",
+                "backfill_started_at": "REAL",
+                "backfill_completed_at": "REAL",
+                "backfill_total": "INTEGER NOT NULL DEFAULT 0",
+                "backfill_processed": "INTEGER NOT NULL DEFAULT 0",
+                "backfill_failed": "INTEGER NOT NULL DEFAULT 0",
+                "backfill_run_token": "TEXT",
+                "backfill_lease_until": "REAL",
+                "backfill_error": "TEXT",
+                "last_notification_status": "TEXT",
+                "last_notification_error": "TEXT",
+                "last_notification_at": "REAL",
                 "is_deleted": "INTEGER NOT NULL DEFAULT 0",
             })
+            conn.execute(
+                """UPDATE tracked_channels
+                   SET recurring_schedule_enabled=schedule_enabled
+                   WHERE backfill_status='not_required' AND schedule_enabled=0
+                     AND recurring_schedule_enabled=1 AND backfill_completed_at IS NULL"""
+            )
             self._ensure_columns(conn, "videos", {
                 "is_starred": "INTEGER NOT NULL DEFAULT 0",
                 "auto_upload_status": "TEXT NOT NULL DEFAULT 'disabled'",
@@ -235,6 +260,9 @@ class AutoCrawlDatabase:
                 "media_type": "TEXT NOT NULL DEFAULT 'video'",
                 "asset_count": "INTEGER NOT NULL DEFAULT 1",
                 "music_path": "TEXT",
+                "backfill_order": "INTEGER",
+                "backfill_state": "TEXT NOT NULL DEFAULT 'not_required'",
+                "backfill_attempts": "INTEGER NOT NULL DEFAULT 0",
             })
             conn.executescript(
                 """
@@ -291,19 +319,43 @@ class AutoCrawlDatabase:
         account_id = str(tiktok_account_id or "main_tiktok").strip()
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", account_id):
             raise ValueError("TikTok account ID không hợp lệ")
-        next_run_at = time.time() + interval * 60 if schedule_enabled else None
+        requested_schedule = bool(schedule_enabled)
+        needs_backfill = account_id != "main_tiktok"
+        now = time.time()
+        backfill_status = "pending" if needs_backfill else "not_required"
+        backfill_cutoff_at = now - 90 * 24 * 3600 if needs_backfill else None
+        backfill_next_run_at = now if needs_backfill else None
+        effective_schedule = requested_schedule and not needs_backfill
+        next_run_at = now + interval * 60 if effective_schedule else None
         with self.connection() as conn:
             archived = conn.execute("SELECT id FROM tracked_channels WHERE profile_url=? AND is_deleted=1", (profile_url.strip(),)).fetchone()
             if archived:
-                next_run_at = time.time() + interval * 60 if schedule_enabled else None
-                conn.execute("""UPDATE tracked_channels SET display_name=?, douyin_uid=?, status='active', interval_minutes=?, schedule_enabled=?, next_run_at=?, auto_upload_enabled=?, translate_enabled=?, tiktok_account_id=?, is_deleted=0, updated_at=? WHERE id=?""", (display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled), int(translate_enabled), account_id, time.time(), archived["id"]))
+                conn.execute(
+                    """UPDATE tracked_channels SET display_name=?, douyin_uid=?, status='active',
+                       interval_minutes=?, schedule_enabled=?, recurring_schedule_enabled=?, next_run_at=?,
+                       auto_upload_enabled=?, translate_enabled=?, tiktok_account_id=?, is_deleted=0,
+                       backfill_status=?, backfill_cutoff_at=?, backfill_next_run_at=?,
+                       backfill_started_at=NULL, backfill_completed_at=NULL, backfill_total=0,
+                       backfill_processed=0, backfill_error=NULL, updated_at=? WHERE id=?""",
+                    (
+                        display_name.strip(), douyin_uid, interval, int(effective_schedule), int(requested_schedule),
+                        next_run_at, int(auto_upload_enabled), int(translate_enabled), account_id,
+                        backfill_status, backfill_cutoff_at, backfill_next_run_at, now, archived["id"],
+                    ),
+                )
                 row = conn.execute("SELECT * FROM tracked_channels WHERE id=?", (archived["id"],)).fetchone()
                 return dict(row) if row else {}
             cur = conn.execute(
                 """INSERT INTO tracked_channels(
-                    profile_url, display_name, douyin_uid, interval_minutes, schedule_enabled, next_run_at, auto_upload_enabled, translate_enabled, tiktok_account_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (profile_url.strip(), display_name.strip(), douyin_uid, interval, int(schedule_enabled), next_run_at, int(auto_upload_enabled), int(translate_enabled), account_id),
+                    profile_url, display_name, douyin_uid, interval_minutes, schedule_enabled,
+                    recurring_schedule_enabled, next_run_at, auto_upload_enabled, translate_enabled,
+                    tiktok_account_id, backfill_status, backfill_cutoff_at, backfill_next_run_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    profile_url.strip(), display_name.strip(), douyin_uid, interval, int(effective_schedule),
+                    int(requested_schedule), next_run_at, int(auto_upload_enabled), int(translate_enabled),
+                    account_id, backfill_status, backfill_cutoff_at, backfill_next_run_at,
+                ),
             )
             row = conn.execute("SELECT * FROM tracked_channels WHERE id=?", (cur.lastrowid,)).fetchone()
             return dict(row) if row else {}
@@ -359,7 +411,15 @@ class AutoCrawlDatabase:
         self.update_channel(channel_id, status="active", error_count=0, error_message=None)
 
     def update_channel(self, channel_id: int, **fields: Any) -> None:
-        allowed = {"status", "last_scraped_at", "last_video_id", "error_count", "error_message", "douyin_uid", "metadata", "interval_minutes", "schedule_enabled", "next_run_at", "last_run_at", "auto_upload_enabled", "translate_enabled", "tiktok_account_id", "is_deleted"}
+        allowed = {
+            "status", "last_scraped_at", "last_video_id", "error_count", "error_message",
+            "douyin_uid", "metadata", "interval_minutes", "schedule_enabled",
+            "recurring_schedule_enabled", "next_run_at", "last_run_at", "auto_upload_enabled",
+            "translate_enabled", "tiktok_account_id", "backfill_status", "backfill_cutoff_at",
+            "backfill_next_run_at", "backfill_started_at", "backfill_completed_at",
+            "backfill_total", "backfill_processed", "backfill_failed", "backfill_run_token", "backfill_lease_until", "backfill_error",
+            "last_notification_status", "last_notification_error", "last_notification_at", "is_deleted",
+        }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -377,11 +437,14 @@ class AutoCrawlDatabase:
 
     def update_channel_schedule(self, channel_id: int, interval_minutes: int, schedule_enabled: bool) -> None:
         interval = max(1, int(interval_minutes))
+        channel = self.get_channel(channel_id) or {}
+        backfill_active = channel.get("backfill_status") in {"pending", "active", "error"}
         self.update_channel(
             channel_id,
             interval_minutes=interval,
-            schedule_enabled=int(schedule_enabled),
-            next_run_at=time.time() + interval * 60 if schedule_enabled else None,
+            recurring_schedule_enabled=int(schedule_enabled),
+            schedule_enabled=0 if backfill_active else int(schedule_enabled),
+            next_run_at=None if backfill_active else (time.time() + interval * 60 if schedule_enabled else None),
         )
 
     def list_due_channels(self, now: float | None = None) -> list[dict[str, Any]]:
@@ -392,6 +455,39 @@ class AutoCrawlDatabase:
                    WHERE status IN ('active','error') AND schedule_enabled=1 AND is_deleted=0
                      AND (next_run_at IS NULL OR next_run_at<=?)
                    ORDER BY COALESCE(next_run_at, 0), id""",
+                (current,),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def claim_backfill_channel(self, channel_id: int, token: str, now: float, lease_seconds: int = 900) -> bool:
+        with self.connection() as conn:
+            cursor = conn.execute(
+                """UPDATE tracked_channels
+                   SET backfill_run_token=?, backfill_lease_until=?
+                   WHERE id=? AND backfill_status IN ('pending','active','error')
+                     AND status IN ('active','error') AND schedule_enabled=0 AND is_deleted=0
+                     AND (backfill_status='pending' OR backfill_next_run_at IS NULL OR backfill_next_run_at<=?)
+                     AND (backfill_lease_until IS NULL OR backfill_lease_until<=?)""",
+                (token, now + lease_seconds, channel_id, now, now),
+            )
+            return cursor.rowcount == 1
+
+    def release_backfill_channel(self, channel_id: int, token: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                "UPDATE tracked_channels SET backfill_run_token=NULL, backfill_lease_until=NULL WHERE id=? AND backfill_run_token=?",
+                (channel_id, token),
+            )
+
+    def list_due_backfill_channels(self, now: float | None = None) -> list[dict[str, Any]]:
+        current = time.time() if now is None else now
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM tracked_channels
+                   WHERE backfill_status IN ('pending','active','error') AND status IN ('active','error') AND is_deleted=0
+                     AND schedule_enabled=0
+                     AND (backfill_next_run_at IS NULL OR backfill_next_run_at<=?)
+                   ORDER BY COALESCE(backfill_next_run_at, 0), id""",
                 (current,),
             ).fetchall()
             return [dict(row) for row in rows]
@@ -451,7 +547,15 @@ class AutoCrawlDatabase:
                 row = conn.execute("SELECT 1 FROM videos WHERE video_id=?", (video_id,)).fetchone()
             return row is not None
 
-    def record_video(self, channel_id: int, video: VideoCandidate, status: str = "pending", skip_reason: str | None = None) -> dict[str, Any]:
+    def record_video(
+        self,
+        channel_id: int,
+        video: VideoCandidate,
+        status: str = "pending",
+        skip_reason: str | None = None,
+        *,
+        enqueue: bool = True,
+    ) -> dict[str, Any]:
         with self.connection() as conn:
             conn.execute(
                 """
@@ -468,7 +572,7 @@ class AutoCrawlDatabase:
                     status, video.published_at, skip_reason, json.dumps(video.raw_data or {}, ensure_ascii=False),
                 ),
             )
-            if status == "pending":
+            if status == "pending" and enqueue:
                 conn.execute(
                     "INSERT OR IGNORE INTO download_queue(video_id, video_url) VALUES (?, ?)",
                     (video.video_id, video.douyin_url),
@@ -478,6 +582,67 @@ class AutoCrawlDatabase:
     def get_video(self, video_id: str) -> dict[str, Any] | None:
         with self.connection() as conn:
             return self._row(conn.execute("SELECT * FROM videos WHERE video_id=?", (video_id,)).fetchone())
+
+    def record_backfill_video(self, channel_id: int, video: VideoCandidate, order: int) -> dict[str, Any]:
+        row = self.record_video(channel_id, video, status="pending", enqueue=False)
+        with self.connection() as conn:
+            conn.execute(
+                """UPDATE videos SET backfill_order=?, backfill_state='pending', backfill_attempts=0
+                   WHERE video_id=? AND channel_id=?""",
+                (int(order), video.video_id, channel_id),
+            )
+        return self.get_video(video.video_id) or row
+
+    def list_pending_backfill_videos(self, channel_id: int, limit: int = 3) -> list[dict[str, Any]]:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT * FROM videos
+                   WHERE channel_id=? AND backfill_state='pending'
+                   ORDER BY backfill_order ASC, published_at ASC, id ASC LIMIT ?""",
+                (channel_id, max(1, int(limit))),
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def count_pending_backfill_videos(self, channel_id: int) -> int:
+        with self.connection() as conn:
+            return int(conn.execute(
+                "SELECT COUNT(*) FROM videos WHERE channel_id=? AND backfill_state='pending'",
+                (channel_id,),
+            ).fetchone()[0])
+
+    def count_backfill_videos(self, channel_id: int, state: str | None = None) -> int:
+        with self.connection() as conn:
+            if state is None:
+                row = conn.execute("SELECT COUNT(*) FROM videos WHERE channel_id=? AND backfill_state!='not_required'", (channel_id,)).fetchone()
+            else:
+                row = conn.execute("SELECT COUNT(*) FROM videos WHERE channel_id=? AND backfill_state=?", (channel_id, state)).fetchone()
+            return int(row[0])
+
+    def update_backfill_video(self, video_id: str, state: str, *, increment_attempts: bool = False) -> None:
+        if state not in {"pending", "processing", "completed", "failed"}:
+            raise ValueError("Invalid backfill video state")
+        with self.connection() as conn:
+            if increment_attempts:
+                conn.execute(
+                    "UPDATE videos SET backfill_state=?, backfill_attempts=backfill_attempts+1 WHERE video_id=?",
+                    (state, video_id),
+                )
+            else:
+                conn.execute("UPDATE videos SET backfill_state=? WHERE video_id=?", (state, video_id))
+
+    def recover_interrupted_backfill_videos(self, channel_id: int) -> None:
+        with self.connection() as conn:
+            rows = conn.execute(
+                """SELECT video_id, auto_upload_status, auto_upload_job_id FROM videos
+                   WHERE channel_id=? AND backfill_state='processing'""",
+                (channel_id,),
+            ).fetchall()
+            for row in rows:
+                accepted = bool(row["auto_upload_job_id"]) and row["auto_upload_status"] not in {None, "failed"}
+                conn.execute(
+                    "UPDATE videos SET backfill_state=? WHERE video_id=?",
+                    ("completed" if accepted else "pending", row["video_id"]),
+                )
 
     def list_videos(self, limit: int = 100) -> list[dict[str, Any]]:
         with self.connection() as conn:
@@ -762,6 +927,48 @@ class DouyinChannelProvider:
         aweme_list = data.get("aweme_list") or data.get("data", {}).get("aweme_list") or []
         return [candidate for item in aweme_list if (candidate := self._parse_aweme(item))]
 
+    async def fetch_channel_history(
+        self,
+        channel: dict[str, Any],
+        cutoff_at: float,
+        *,
+        page_size: int = 20,
+        max_pages: int = 100,
+    ) -> list[VideoCandidate]:
+        crawler = await self._crawler()
+        sec_user_id = channel.get("douyin_uid")
+        if not sec_user_id:
+            sec_user_id = await crawler.get_sec_user_id(channel["profile_url"])
+        cursor = 0
+        seen_cursors: set[int] = set()
+        by_id: dict[str, VideoCandidate] = {}
+        for _ in range(max_pages):
+            if cursor in seen_cursors:
+                break
+            seen_cursors.add(cursor)
+            response = await crawler.fetch_user_post_videos(sec_user_id, cursor, page_size)
+            data = response if isinstance(response, dict) else {}
+            nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+            aweme_list = data.get("aweme_list") or nested.get("aweme_list") or []
+            reached_cutoff = False
+            for item in aweme_list:
+                candidate = self._parse_aweme(item)
+                if not candidate or not candidate.published_at:
+                    continue
+                if candidate.published_at < cutoff_at:
+                    reached_cutoff = True
+                    continue
+                by_id.setdefault(candidate.video_id, candidate)
+            has_more = bool(data.get("has_more", nested.get("has_more", False)))
+            next_cursor = data.get("max_cursor", nested.get("max_cursor"))
+            if reached_cutoff or not has_more or next_cursor is None:
+                break
+            try:
+                cursor = int(next_cursor)
+            except (TypeError, ValueError):
+                break
+        return sorted(by_id.values(), key=lambda candidate: float(candidate.published_at or 0))
+
     def _parse_aweme(self, item: dict[str, Any]) -> VideoCandidate | None:
         video_id = str(item.get("aweme_id") or item.get("group_id") or "").strip()
         if not video_id:
@@ -810,6 +1017,8 @@ class TikTokAutoUploader:
                 "account": account_id,
                 "caption": translated_title or "Bài ảnh mới",
             }
+            if video.get("backfill"):
+                payload["idempotency_key"] = f"backfill:{account_id}:{photo_id}"
             target_endpoint = self.photo_endpoint
         else:
             filename = Path(str(video.get("local_path") or "")).name
@@ -821,6 +1030,8 @@ class TikTokAutoUploader:
                 "caption": translated_title or "Video mới",
                 "options": {"visibility_type": 0, "allow_comment": 1, "allow_duet": 0, "allow_stitch": 0},
             }
+            if video.get("backfill"):
+                payload["idempotency_key"] = f"backfill:{account_id}:{video.get('video_id')}"
             target_endpoint = self.endpoint
         if self.client is not None:
             response = await self.client.post(target_endpoint, json=payload, timeout=900)
@@ -839,13 +1050,134 @@ class TikTokAutoUploader:
         return await self.upload_translated(video, translated_title)
 
 
+class CrawlProgressEmailReporter:
+    def __init__(self, accounts_url: str | None = None, client: Any | None = None):
+        service_url = os.getenv("TIKTOK_UPLOAD_SERVICE_URL", "http://tiktok-uploader:8001").rstrip("/")
+        self.accounts_url = accounts_url or f"{service_url}/api/tiktok/accounts"
+        self.client = client
+
+    async def _notification_email(self, account_id: str) -> str:
+        if self.client is not None:
+            response = await self.client.get(self.accounts_url, timeout=15)
+        else:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.get(self.accounts_url)
+        response.raise_for_status()
+        payload = response.json()
+        for item in payload.get("items", []):
+            if str(item.get("id")) == account_id:
+                return str(item.get("notification_email") or "").strip()
+        return ""
+
+    @staticmethod
+    def _send_email(recipient: str, subject: str, body: str) -> None:
+        host = os.getenv("SMTP_HOST", "").strip()
+        port = int(os.getenv("SMTP_PORT", "587"))
+        username = os.getenv("SMTP_USERNAME", "").strip()
+        password = os.getenv("SMTP_PASSWORD", "")
+        if not password:
+            password_file = Path(os.getenv("SMTP_PASSWORD_FILE", "/app/secrets/smtp_password.txt"))
+            try:
+                password = password_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                password = ""
+        sender = os.getenv("SMTP_FROM", username).strip()
+        if not host or not sender:
+            raise RuntimeError("SMTP chưa được cấu hình")
+        message = EmailMessage()
+        message["From"] = sender
+        message["To"] = recipient
+        message["Subject"] = subject
+        message.set_content(body)
+        use_ssl = os.getenv("SMTP_USE_SSL", "false").lower() == "true" or port == 465
+        tls_context = ssl.create_default_context()
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=30, context=tls_context) as smtp:
+                if username:
+                    smtp.login(username, password)
+                smtp.send_message(message)
+            return
+        with smtplib.SMTP(host, port, timeout=30) as smtp:
+            if os.getenv("SMTP_STARTTLS", "true").lower() != "false":
+                smtp.starttls(context=tls_context)
+            elif username or password:
+                raise RuntimeError("SMTP credentials yêu cầu STARTTLS hoặc SMTP_SSL")
+            if username:
+                smtp.login(username, password)
+            smtp.send_message(message)
+
+    async def report(self, channel: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+        if not os.getenv("SMTP_HOST", "").strip():
+            return {"status": "not_configured", "error": "SMTP chưa được cấu hình"}
+        account_id = str(channel.get("tiktok_account_id") or "main_tiktok")
+        recipient = await self._notification_email(account_id)
+        if not recipient:
+            return {"status": "no_recipient", "error": "TikTok account chưa có email báo cáo"}
+        kind = str(event.get("kind") or "crawl_completed")
+        labels = {
+            "backfill_progress": "Tiến trình crawl lịch sử",
+            "backfill_completed": "Đã hoàn tất crawl lịch sử",
+            "backfill_error": "Crawl lịch sử gặp lỗi",
+            "crawl_completed": "Đã hoàn tất crawl định kỳ",
+            "crawl_error": "Crawl định kỳ gặp lỗi",
+        }
+        title = labels.get(kind, "Báo cáo crawl")
+        processed = int(event.get("processed") or 0)
+        remaining = int(event.get("remaining") or 0)
+        total = int(event.get("total") or 0)
+        failed = int(event.get("failed") or 0)
+        error = str(event.get("error") or "").strip()
+        body = (
+            f"Kênh Douyin: {channel.get('display_name') or channel.get('profile_url')}\n"
+            f"TikTok account: {account_id}\n"
+            f"Trạng thái: {title}\n"
+            f"Đã xử lý trong đợt: {processed}\n"
+            f"Đã hoàn tất: {max(0, total - remaining - failed)}\n"
+            f"Thất bại sau retry: {failed}\n"
+            f"Còn lại: {remaining}\n"
+        )
+        if error:
+            body += f"Lỗi: {error}\n"
+        await asyncio.to_thread(self._send_email, recipient, f"[NWM] {title} - {channel.get('display_name') or account_id}", body)
+        return {"status": "sent", "error": None}
+
+
 class AutoCrawlManager:
-    def __init__(self, db: AutoCrawlDatabase | None = None, provider: Any | None = None, downloader: Any | None = None, auto_uploader: Any | None = None, config: AutoCrawlConfig | None = None):
+    def __init__(
+        self,
+        db: AutoCrawlDatabase | None = None,
+        provider: Any | None = None,
+        downloader: Any | None = None,
+        auto_uploader: Any | None = None,
+        config: AutoCrawlConfig | None = None,
+        progress_reporter: Any | None = None,
+    ):
         self.db = db or AutoCrawlDatabase()
         self.config = config or AutoCrawlConfig.from_env()
         self.provider = provider or DouyinChannelProvider()
         self.downloader = downloader or DownloadService()
         self.auto_uploader = auto_uploader or TikTokAutoUploader()
+        self.progress_reporter = progress_reporter or CrawlProgressEmailReporter()
+        self._backfill_locks: dict[int, asyncio.Lock] = {}
+
+    async def _report_progress(self, channel_id: int, event: dict[str, Any]) -> dict[str, Any]:
+        channel = self.db.get_channel(channel_id)
+        if not channel:
+            return {"status": "channel_missing", "error": "Channel not found"}
+        try:
+            result = await self.progress_reporter.report(channel, event)
+            status = str((result or {}).get("status") or "unknown")
+            error = str((result or {}).get("error") or "") or None
+        except Exception as exc:
+            status = "failed"
+            error = str(exc)
+        self.db.update_channel(
+            channel_id,
+            last_notification_status=status,
+            last_notification_error=error,
+            last_notification_at=time.time(),
+        )
+        return {"status": status, "error": error}
 
     def run_once_sync(self, channel_id: int | None = None, download: bool | None = None) -> dict[str, Any]:
         return asyncio.run(self.run_once(channel_id=channel_id, download=download))
@@ -926,7 +1258,7 @@ class AutoCrawlManager:
         video_id: str,
         force: bool = False,
         translate_enabled_override: bool | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         video = self.db.get_video(video_id)
         if not video or video.get("download_status") != "completed":
             return
@@ -980,9 +1312,9 @@ class AutoCrawlManager:
                     self.db.update_video_translated_title(video_id, translated_title)
             status = str(job.get("status") or "running")
             error = str(job.get("error") or "") or None
-            self.db.update_video_auto_upload(video_id, status=status, job_id=str(job.get("id") or "") or None, error=error)
+            return self.db.update_video_auto_upload(video_id, status=status, job_id=str(job.get("id") or "") or None, error=error)
         except Exception as exc:
-            self.db.update_video_auto_upload(video_id, status="failed", error=str(exc))
+            return self.db.update_video_auto_upload(video_id, status="failed", error=str(exc))
 
     async def process_queue(self, limit: int = 20) -> dict[str, int]:
         rows = self.db.list_queue(status="queued", limit=limit)
@@ -1009,15 +1341,194 @@ class AutoCrawlManager:
                 failed += 1
         return {"processed": len(rows), "completed": completed, "failed": failed}
 
+    @staticmethod
+    def _video_candidate_from_row(video: dict[str, Any]) -> VideoCandidate:
+        raw_data = video.get("raw_data") or {}
+        if isinstance(raw_data, str):
+            try:
+                raw_data = json.loads(raw_data)
+            except (TypeError, ValueError):
+                raw_data = {}
+        return VideoCandidate(
+            video_id=str(video["video_id"]),
+            douyin_url=str(video.get("douyin_url") or ""),
+            title=str(video.get("title") or ""),
+            description=str(video.get("description") or ""),
+            author_nickname=str(video.get("author_nickname") or ""),
+            author_uid=str(video.get("author_uid") or ""),
+            published_at=video.get("published_at"),
+            view_count=int(video.get("view_count") or 0),
+            like_count=int(video.get("like_count") or 0),
+            comment_count=int(video.get("comment_count") or 0),
+            share_count=int(video.get("share_count") or 0),
+            duration_sec=int(video.get("duration_sec") or 0),
+            raw_data=raw_data if isinstance(raw_data, dict) else {},
+        )
+
+    async def run_backfill_batch(self, channel_id: int, *, now: float | None = None, daily_limit: int = 3) -> dict[str, Any]:
+        token = uuid.uuid4().hex
+        current = time.time() if now is None else float(now)
+        lock = self._backfill_locks.setdefault(channel_id, asyncio.Lock())
+        async with lock:
+            if not self.db.claim_backfill_channel(channel_id, token, current):
+                return {"status": "deferred", "processed": 0, "remaining": 0, "error": "backfill lease held by another worker"}
+            try:
+                return await self._run_backfill_batch_unlocked(channel_id, now=now, daily_limit=daily_limit)
+            except Exception as exc:
+                channel = self.db.get_channel(channel_id) or {}
+                error = str(exc)
+                self.db.update_channel(channel_id, backfill_status="error", backfill_next_run_at=current + 3600, backfill_error=error, schedule_enabled=0, next_run_at=None)
+                remaining = self.db.count_pending_backfill_videos(channel_id)
+                notification = await self._report_progress(channel_id, {"kind": "backfill_error", "processed": 0, "remaining": remaining, "total": int(channel.get("backfill_total") or 0), "error": error})
+                return {"status": "error", "processed": 0, "remaining": remaining, "error": error, "notification": notification}
+            finally:
+                self.db.release_backfill_channel(channel_id, token)
+
+    async def _run_backfill_batch_unlocked(self, channel_id: int, *, now: float | None = None, daily_limit: int = 3) -> dict[str, Any]:
+        current = time.time() if now is None else float(now)
+        limit = min(3, max(1, int(daily_limit)))
+        channel = self.db.get_channel(channel_id)
+        if not channel or channel.get("is_deleted"):
+            raise ValueError("Channel not found")
+        if channel.get("backfill_status") in {"not_required", "completed"}:
+            return {"status": str(channel.get("backfill_status")), "processed": 0, "remaining": 0}
+        due_at = float(channel.get("backfill_next_run_at") or 0)
+        if channel.get("backfill_status") in {"active", "error"} and due_at > current:
+            return {
+                "status": "deferred",
+                "processed": 0,
+                "remaining": self.db.count_pending_backfill_videos(channel_id),
+                "next_run_at": due_at,
+            }
+
+        self.db.recover_interrupted_backfill_videos(channel_id)
+        if channel.get("backfill_status") == "pending":
+            cutoff_at = float(channel.get("backfill_cutoff_at") or (current - 90 * 24 * 3600))
+            fetch_history = getattr(self.provider, "fetch_channel_history", None)
+            if fetch_history is None:
+                raise RuntimeError("Douyin provider does not support historical pagination")
+            candidates = await self.provider.fetch_channel_history(channel, cutoff_at)
+            accepted = 0
+            for candidate in sorted(candidates, key=lambda item: float(item.published_at or 0)):
+                target_account = str(channel.get("tiktok_account_id") or "main_tiktok")
+                existing_source = self.db.get_video(candidate.video_id)
+                if existing_source and target_account != "main_tiktok":
+                    existing_raw = existing_source.get("raw_data") or {}
+                    if isinstance(existing_raw, str):
+                        try:
+                            existing_raw = json.loads(existing_raw)
+                        except (TypeError, ValueError):
+                            existing_raw = {}
+                    existing_target = str(existing_raw.get("tiktok_account_id") or "main_tiktok") if isinstance(existing_raw, dict) else "main_tiktok"
+                    if existing_target != target_account:
+                        candidate = replace(candidate, video_id=f"{candidate.video_id}__backfill__{target_account}")
+                should_collect, _ = self._should_collect(candidate, ignore_age=True)
+                if not should_collect:
+                    continue
+                raw_data = dict(candidate.raw_data or {})
+                raw_data["translate_enabled"] = bool(channel.get("translate_enabled"))
+                raw_data["tiktok_account_id"] = str(channel.get("tiktok_account_id") or "main_tiktok")
+                raw_data["backfill"] = True
+                candidate.raw_data = raw_data
+                self.db.record_backfill_video(channel_id, candidate, accepted)
+                accepted += 1
+            self.db.update_channel(
+                channel_id,
+                backfill_status="active",
+                backfill_started_at=channel.get("backfill_started_at") or current,
+                backfill_total=accepted,
+                backfill_processed=self.db.count_backfill_videos(channel_id, "completed"),
+                backfill_failed=self.db.count_backfill_videos(channel_id, "failed"),
+                backfill_error=None,
+                schedule_enabled=0,
+                next_run_at=None,
+            )
+
+        processed = 0
+        error: str | None = None
+        for video in self.db.list_pending_backfill_videos(channel_id, limit=limit):
+            video_id = str(video["video_id"])
+            self.db.update_backfill_video(video_id, "processing", increment_attempts=True)
+            try:
+                if video.get("download_status") != "completed":
+                    await self._download_candidate(self._video_candidate_from_row(video), channel_id=channel_id)
+                downloaded = self.db.get_video(video_id) or {}
+                if downloaded.get("download_status") != "completed":
+                    raise RuntimeError(str(downloaded.get("download_error") or "Không tải được video Douyin"))
+                uploaded = await self._auto_upload_if_enabled(video_id, force=True)
+                if not uploaded or uploaded.get("auto_upload_status") == "failed" or not uploaded.get("auto_upload_job_id"):
+                    raise RuntimeError(str((uploaded or {}).get("auto_upload_error") or "TikTok không nhận upload job"))
+                self.db.update_backfill_video(video_id, "completed")
+                processed += 1
+            except Exception as exc:
+                error = str(exc)
+                attempts = int(video.get("backfill_attempts") or 0) + 1
+                self.db.update_backfill_video(video_id, "failed" if attempts >= 3 else "pending")
+                break
+
+        completed_count = self.db.count_backfill_videos(channel_id, "completed")
+        failed_count = self.db.count_backfill_videos(channel_id, "failed")
+        remaining = self.db.count_pending_backfill_videos(channel_id)
+        channel = self.db.get_channel(channel_id) or channel
+        if remaining == 0:
+            recurring = bool(channel.get("recurring_schedule_enabled"))
+            interval = max(1, int(channel.get("interval_minutes") or 60))
+            self.db.update_channel(
+                channel_id,
+                backfill_status="completed",
+                backfill_completed_at=current,
+                backfill_next_run_at=None,
+                backfill_processed=completed_count,
+                backfill_failed=failed_count,
+                backfill_error=error if failed_count else None,
+                schedule_enabled=int(recurring),
+                next_run_at=current + interval * 60 if recurring else None,
+                last_run_at=current,
+                status="active",
+            )
+            status = "completed"
+        else:
+            self.db.update_channel(
+                channel_id,
+                backfill_status="error" if error else "active",
+                backfill_next_run_at=current + 24 * 3600,
+                backfill_processed=completed_count,
+                backfill_error=error,
+                schedule_enabled=0,
+                next_run_at=None,
+            )
+            status = "error" if error else "active"
+        channel = self.db.get_channel(channel_id) or channel
+        notification = await self._report_progress(channel_id, {
+            "kind": "backfill_completed" if status == "completed" else ("backfill_error" if error else "backfill_progress"),
+            "processed": processed,
+            "remaining": remaining,
+            "total": int(channel.get("backfill_total") or 0),
+            "failed": failed_count,
+            "error": error,
+        })
+        return {
+            "status": status,
+            "processed": processed,
+            "remaining": remaining,
+            "error": error,
+            "notification": notification,
+        }
+
     async def run_once(self, channel_id: int | None = None, download: bool | None = None) -> dict[str, Any]:
         do_download = self.config.download_new_videos if download is None else bool(download)
-        session_id = self.db.create_session()
         channels = [self.db.get_channel(channel_id)] if channel_id else self.db.list_channels(status="active")[: self.config.channels_per_batch]
         channels = [c for c in channels if c]
+        if channel_id and channels and channels[0].get("backfill_status") in {"pending", "active", "error"}:
+            raise RuntimeError("Kênh đang crawl lịch sử; lịch crawl thường bị khóa cho tới khi backfill hoàn tất")
+        channels = [c for c in channels if c.get("backfill_status") not in {"pending", "active", "error"}]
+        session_id = self.db.create_session()
         success = fail = new_videos = skipped = 0
         error_message = None
         self.db.update_session_progress(session_id, total_channels=len(channels))
         for channel in channels:
+            channel_new_before = new_videos
+            channel_error: str | None = None
             try:
                 candidates = await self.provider.fetch_channel_videos(channel, self.config)
                 first_crawl = not channel.get("last_scraped_at")
@@ -1077,12 +1588,21 @@ class AutoCrawlManager:
             except Exception as exc:
                 fail += 1
                 error_message = str(exc)
+                channel_error = error_message
                 count = int(channel.get("error_count") or 0) + 1
                 # A scheduled crawl is continuous by definition. Transient
                 # provider failures remain visible as ``error`` but must not
                 # silently become ``paused`` and disappear from future runs.
                 status = "error"
                 self.db.update_channel(channel["id"], status=status, error_count=count, error_message=error_message, last_scraped_at=time.time())
+            channel_processed = new_videos - channel_new_before
+            await self._report_progress(channel["id"], {
+                "kind": "crawl_error" if channel_error else "crawl_completed",
+                "processed": channel_processed,
+                "remaining": 0,
+                "total": channel_processed,
+                "error": channel_error,
+            })
             self.db.update_session_progress(
                 session_id,
                 total_channels=len(channels),
@@ -1196,7 +1716,15 @@ class AutoCrawlScheduler:
             for row in self.manager.db.list_channels()
             if row.get("status") in {"active", "error"} and row.get("schedule_enabled")
         ]
+        backfills = [
+            row
+            for row in self.manager.db.list_channels()
+            if row.get("backfill_status") in {"pending", "active", "error"}
+            and row.get("status") in {"active", "error"}
+            and not row.get("is_deleted")
+        ]
         due_times = [row.get("next_run_at") for row in scheduled if row.get("next_run_at")]
+        due_times.extend(row.get("backfill_next_run_at") for row in backfills if row.get("backfill_next_run_at"))
         effective_next_run = min(due_times) if due_times else self.next_run_at
         countdown = None
         if self.enabled and effective_next_run:
@@ -1206,6 +1734,7 @@ class AutoCrawlScheduler:
             "running": bool(self._task and not self._task.done()),
             "interval_minutes": self.interval_minutes,
             "scheduled_jobs": len(scheduled),
+            "backfill_jobs": len(backfills),
             "last_run_at": self.last_run_at,
             "next_run_at": effective_next_run,
             "countdown_seconds": countdown,
@@ -1236,22 +1765,33 @@ class AutoCrawlScheduler:
         return self.status()
 
     async def run_due_channels(self) -> dict[str, Any]:
-        due = self.manager.db.list_due_channels()[:1]
+        normal = [(float(row.get("next_run_at") or 0), "normal", row) for row in self.manager.db.list_due_channels()]
+        backfill = [
+            (float(row.get("backfill_next_run_at") or 0), "backfill", row)
+            for row in self.manager.db.list_due_backfill_channels()
+        ]
+        due = sorted(normal + backfill, key=lambda item: (item[0], item[2]["id"]))[:1]
         completed = failed = 0
         results = []
-        for channel in due:
+        for _, mode, channel in due:
             try:
-                result = await self.manager.run_once(channel_id=channel["id"], download=True)
-                results.append(result)
-                if result.get("status") == "completed":
-                    completed += 1
+                if mode == "backfill":
+                    result = await self.manager.run_backfill_batch(channel["id"])
                 else:
+                    result = await self.manager.run_once(channel_id=channel["id"], download=True)
+                    self.manager.db.mark_channel_scheduled_run(channel["id"])
+                results.append(result)
+                if (mode == "normal" and result.get("status") != "completed") or (
+                    mode == "backfill" and result.get("status") == "error"
+                ):
                     failed += 1
+                else:
+                    completed += 1
             except Exception as exc:
                 failed += 1
                 self.last_error = str(exc)
-            finally:
-                self.manager.db.mark_channel_scheduled_run(channel["id"])
+                if mode == "normal":
+                    self.manager.db.mark_channel_scheduled_run(channel["id"])
         if due:
             self.last_run_at = time.time()
             self.last_result = {"processed": len(due), "completed": completed, "failed": failed, "results": results}
@@ -1266,6 +1806,13 @@ class AutoCrawlScheduler:
                 and row.get("schedule_enabled")
                 and row.get("next_run_at")
             ]
+            due_times.extend(
+                row.get("backfill_next_run_at")
+                for row in self.manager.db.list_channels()
+                if row.get("backfill_status") in {"pending", "active", "error"}
+                and row.get("status") in {"active", "error"}
+                and row.get("backfill_next_run_at")
+            )
             self.next_run_at = min(due_times) if due_times else time.time() + 30
             await asyncio.sleep(30)
             if not self.enabled:

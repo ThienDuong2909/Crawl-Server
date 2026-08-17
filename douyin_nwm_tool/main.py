@@ -22,7 +22,13 @@ from .parser import DouyinParser
 async def lifespan(app: FastAPI):
     autocrawl_scheduler.manager = autocrawl_manager
     has_scheduled_jobs = any(row.get("schedule_enabled") and row.get("status") == "active" for row in autocrawl_manager.db.list_channels())
-    if autocrawl_scheduler.enabled or has_scheduled_jobs:
+    has_backfill_jobs = any(
+        row.get("backfill_status") in {"pending", "active", "error"}
+        and row.get("status") in {"active", "error"}
+        and not row.get("is_deleted")
+        for row in autocrawl_manager.db.list_channels()
+    )
+    if autocrawl_scheduler.enabled or has_scheduled_jobs or has_backfill_jobs:
         autocrawl_scheduler.start()
     yield
     autocrawl_scheduler.stop()
@@ -265,6 +271,16 @@ async def _run_initial_channel_crawl(
     channel_id: int,
     schedule_enabled: bool,
 ) -> None:
+    channel = manager.db.get_channel(channel_id)
+    if channel and channel.get("backfill_status") in {"pending", "active", "error"}:
+        try:
+            await manager.run_backfill_batch(channel_id)
+        finally:
+            current = manager.db.get_channel(channel_id)
+            if current and not current.get("is_deleted"):
+                scheduler.manager = manager
+                scheduler.start()
+        return
     try:
         await manager.run_once(channel_id=channel_id, download=True)
     finally:
@@ -353,6 +369,8 @@ async def crawl_update_channel(channel_id: int, payload: CrawlChannelStatusReque
         autocrawl_manager.db.update_channel(channel_id, translate_enabled=int(payload.translate_enabled))
     if payload.tiktok_account_id is not None:
         account_id = payload.tiktok_account_id.strip()
+        if channel.get("backfill_status") in {"pending", "active", "error"} and account_id != str(channel.get("tiktok_account_id") or "main_tiktok"):
+            raise HTTPException(status_code=409, detail="Không thể đổi TikTok account khi backfill đang chạy; hãy hoàn tất hoặc xóa kênh trước")
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", account_id):
             raise HTTPException(status_code=400, detail="TikTok account ID không hợp lệ")
         autocrawl_manager.db.update_channel(channel_id, tiktok_account_id=account_id)
@@ -369,6 +387,13 @@ async def crawl_delete_channel(channel_id: int):
 
 @app.post("/api/crawl/run")
 async def crawl_run(payload: CrawlRunRequest, background_tasks: BackgroundTasks):
+    if payload.channel_id is not None:
+        channel = autocrawl_manager.db.get_channel(payload.channel_id)
+        if channel and channel.get("backfill_status") in {"pending", "active", "error"}:
+            raise HTTPException(
+                status_code=409,
+                detail="Kênh đang crawl lịch sử; crawl thường chỉ chạy sau khi hoàn tất backfill",
+            )
     # Run synchronously for explicit operator feedback; per-channel errors are captured in the session.
     return await autocrawl_manager.run_once(channel_id=payload.channel_id, download=payload.download)
 

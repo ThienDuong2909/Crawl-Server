@@ -8,6 +8,7 @@ import random
 import re
 import secrets
 import threading
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ import httpx
 from Cryptodome.Cipher import AES
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.responses import FileResponse
 
 
@@ -68,11 +69,22 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 
 def _write_secret_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
         path.chmod(0o600)
-    except OSError:
-        pass
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def load_tiktok_oauth_config() -> dict[str, str]:
@@ -192,6 +204,7 @@ def _default_account_record() -> dict[str, Any]:
     return {
         "id": DEFAULT_TIKTOK_ACCOUNT_ID,
         "display_name": "TikTok hiện tại",
+        "notification_email": "",
         "is_default": True,
         "created_at": None,
         "updated_at": None,
@@ -211,15 +224,23 @@ def save_tiktok_accounts_registry(payload: dict[str, Any]) -> None:
     _write_secret_json(tiktok_accounts_registry_path(), payload)
 
 
-def create_tiktok_account(display_name: str) -> dict[str, Any]:
+def create_tiktok_account(display_name: str, notification_email: str = "") -> dict[str, Any]:
     label = str(display_name or "").strip()
+    email = str(notification_email or "").strip().lower()
     if not label:
         raise HTTPException(status_code=400, detail="TikTok account display name is required")
     registry = load_tiktok_accounts_registry()
     base = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "tiktok"
     account_id = f"{base[:48]}-{secrets.token_hex(3)}"
     now = time.time()
-    item = {"id": account_id, "display_name": label[:128], "is_default": False, "created_at": now, "updated_at": now}
+    item = {
+        "id": account_id,
+        "display_name": label[:128],
+        "notification_email": email,
+        "is_default": False,
+        "created_at": now,
+        "updated_at": now,
+    }
     registry["items"].append(item)
     save_tiktok_accounts_registry(registry)
     return account_public_status(item)
@@ -239,6 +260,7 @@ def account_public_status(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": account_id,
         "display_name": str(item.get("display_name") or account_id),
+        "notification_email": str(item.get("notification_email") or ""),
         "is_default": account_id == DEFAULT_TIKTOK_ACCOUNT_ID,
         "has_access_token": bool(token.get("access_token")),
         "open_id": str(token.get("open_id") or ""),
@@ -252,6 +274,18 @@ def account_public_status(item: dict[str, Any]) -> dict[str, Any]:
 def list_tiktok_accounts() -> dict[str, Any]:
     registry = load_tiktok_accounts_registry()
     return {"default_account_id": DEFAULT_TIKTOK_ACCOUNT_ID, "items": [account_public_status(item) for item in registry["items"]]}
+
+
+def update_tiktok_account_notification(account_id: str, notification_email: str) -> dict[str, Any]:
+    safe_id = validate_account_id(account_id)
+    registry = load_tiktok_accounts_registry()
+    for item in registry["items"]:
+        if item.get("id") == safe_id:
+            item["notification_email"] = str(notification_email or "").strip().lower()
+            item["updated_at"] = time.time()
+            save_tiktok_accounts_registry(registry)
+            return account_public_status(item)
+    raise HTTPException(status_code=404, detail="TikTok account not found")
 
 
 def delete_tiktok_account(account_id: str) -> None:
@@ -323,6 +357,29 @@ class TikTokOAuthAccountCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     display_name: str = Field(min_length=1, max_length=128)
+    notification_email: str = Field(default="", max_length=254)
+
+    @field_validator("notification_email")
+    @classmethod
+    def validate_notification_email(cls, value: str) -> str:
+        email = str(value or "").strip().lower()
+        if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise ValueError("notification_email must be a valid email address")
+        return email
+
+
+class TikTokAccountNotificationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    notification_email: str = Field(max_length=254)
+
+    @field_validator("notification_email")
+    @classmethod
+    def validate_notification_email(cls, value: str) -> str:
+        email = str(value or "").strip().lower()
+        if email and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+            raise ValueError("notification_email must be a valid email address")
+        return email
 
 
 class TikTokAccountUpdate(BaseModel):
@@ -396,6 +453,7 @@ class UploadJobRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     account: str = Field(min_length=1, max_length=128)
     caption: str = Field(min_length=1, max_length=2200)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=256, pattern=r"^[A-Za-z0-9:_-]+$")
     options: UploadOptions = Field(default_factory=UploadOptions)
 
 
@@ -403,6 +461,7 @@ class PhotoUploadJobRequest(BaseModel):
     photo_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     account: str = Field(min_length=1, max_length=128)
     caption: str = Field(default="", max_length=4000)
+    idempotency_key: str | None = Field(default=None, min_length=1, max_length=256, pattern=r"^[A-Za-z0-9:_-]+$")
 
 
 class N8nStatusCallback(BaseModel):
@@ -421,6 +480,7 @@ class UploadJob:
     account: str
     caption: str
     options: dict[str, Any]
+    idempotency_key: str | None = None
     status: Literal["queued", "running", "success", "failed"] = "queued"
     progress: int = 0
     message: str = "Queued"
@@ -436,6 +496,7 @@ class UploadJob:
             "account": self.account,
             "caption": self.caption,
             "options": self.options,
+            "idempotency_key": self.idempotency_key,
             "status": self.status,
             "progress": self.progress,
             "message": self.message,
@@ -656,7 +717,32 @@ class UploadJobManager:
         mode = os.getenv("TIKTOK_UPLOAD_MODE", settings.upload_mode).strip() or "dry_run"
         return mode != "dry_run"
 
+    def _find_idempotent_job(self, key: str) -> UploadJob | None:
+        path = settings.data_dir / "upload_history.jsonl"
+        if not path.exists():
+            return None
+        found = None
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try:
+                    item = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if item.get("idempotency_key") == key:
+                    found = item
+        except OSError:
+            return None
+        if not found:
+            return None
+        allowed = {"id", "filename", "account", "caption", "options", "idempotency_key", "status", "progress", "message", "created_at", "updated_at", "result", "error"}
+        return UploadJob(**{name: found.get(name) for name in allowed if name in found})
+
     def create_and_run(self, payload: UploadJobRequest) -> UploadJob:
+        if payload.idempotency_key:
+            existing = self.jobs.get(payload.idempotency_key) or self._find_idempotent_job(payload.idempotency_key)
+            if existing:
+                self.jobs[existing.id] = existing
+                return existing
         video_path = resolve_video_path(payload.filename)
         job = UploadJob(
             id=uuid.uuid4().hex,
@@ -664,8 +750,10 @@ class UploadJobManager:
             account=payload.account,
             caption=payload.caption,
             options=payload.options.model_dump(),
+            idempotency_key=payload.idempotency_key,
         )
         self.jobs[job.id] = job
+        self._safe_append_history(job)
         self._run(job, video_path)
         return job
 
@@ -925,6 +1013,11 @@ def fetch_tiktok_publish_status(publish_id: str, account_id: str = DEFAULT_TIKTO
 
 
 def create_photo_upload_job(payload: PhotoUploadJobRequest) -> UploadJob:
+    if payload.idempotency_key:
+        existing = job_manager.jobs.get(payload.idempotency_key) or job_manager._find_idempotent_job(payload.idempotency_key)
+        if existing:
+            job_manager.jobs[existing.id] = existing
+            return existing
     _, manifest, image_paths = resolve_photo_album(payload.photo_id)
     job = UploadJob(
         id=uuid.uuid4().hex,
@@ -932,11 +1025,13 @@ def create_photo_upload_job(payload: PhotoUploadJobRequest) -> UploadJob:
         account=payload.account,
         caption=payload.caption,
         options={"media_type": "photo", "asset_count": len(image_paths)},
+        idempotency_key=payload.idempotency_key,
         status="running",
         progress=30,
         message="Đang chuẩn bị bài ảnh cho TikTok Inbox",
     )
     job_manager.jobs[job.id] = job
+    job_manager._safe_append_history(job)
     try:
         watermark_processing = manifest.get("watermark_processing") or {}
         if watermark_processing.get("status") != "clean":
@@ -1126,7 +1221,12 @@ async def tiktok_accounts():
 
 @app.post("/api/tiktok/accounts")
 async def tiktok_create_account(payload: TikTokOAuthAccountCreate):
-    return create_tiktok_account(payload.display_name)
+    return create_tiktok_account(payload.display_name, payload.notification_email)
+
+
+@app.patch("/api/tiktok/accounts/{account_id}/notification")
+async def tiktok_update_account_notification(account_id: str, payload: TikTokAccountNotificationUpdate):
+    return update_tiktok_account_notification(account_id, payload.notification_email)
 
 
 @app.delete("/api/tiktok/accounts/{account_id}")

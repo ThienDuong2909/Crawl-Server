@@ -3,6 +3,26 @@ from urllib.parse import parse_qs, urlparse
 from fastapi.testclient import TestClient
 
 
+def test_tiktok_account_stores_valid_notification_email_without_exposing_secrets(monkeypatch, tmp_path):
+    from tiktok_upload_service import main
+
+    monkeypatch.setattr(main.settings, "data_dir", tmp_path)
+    client = TestClient(main.app)
+    created = client.post("/api/tiktok/accounts", json={
+        "display_name": "Báo cáo",
+        "notification_email": "owner@example.com",
+    })
+
+    assert created.status_code == 200
+    assert created.json()["notification_email"] == "owner@example.com"
+    listed = client.get("/api/tiktok/accounts").json()["items"]
+    assert next(item for item in listed if item["id"] == created.json()["id"])["notification_email"] == "owner@example.com"
+    assert client.post("/api/tiktok/accounts", json={
+        "display_name": "Sai email",
+        "notification_email": "not-an-email",
+    }).status_code == 422
+
+
 def test_token_key_rotation_reencrypts_with_new_primary_key(monkeypatch, tmp_path):
     import base64
     from tiktok_upload_service import main
